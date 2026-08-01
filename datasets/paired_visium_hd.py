@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import random
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,7 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 from torch.utils.data import Dataset
+from sklearn.decomposition import IncrementalPCA
 
 from utils import make_coord
 
@@ -130,6 +131,84 @@ def _gene_rms(
     return np.maximum(result, 1e-6)
 
 
+def _normalized_expression_batch(
+    matrix: sp.csr_matrix,
+    observations: np.ndarray,
+    gene_indices: np.ndarray,
+    library_size: np.ndarray,
+    target_sum: float,
+    gene_scale: np.ndarray,
+) -> np.ndarray:
+    """Return gene-wise scaled log-CP10K without materializing the full matrix."""
+    counts = matrix[observations, :][:, gene_indices].toarray().astype(np.float32)
+    values = np.log1p(
+        counts * (target_sum / np.maximum(library_size[observations], 1.0))[:, None]
+    )
+    return values / gene_scale[None, :]
+
+
+def _fit_lr_pca_context(
+    matrix: sp.csr_matrix,
+    train_observations: np.ndarray,
+    gene_indices: np.ndarray,
+    library_size: np.ndarray,
+    target_sum: float,
+    gene_scale: np.ndarray,
+    n_components: int,
+    batch_size: int = 2048,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit PCA on LR training observations and transform every LR observation."""
+    if n_components <= 0:
+        return (
+            np.empty((matrix.shape[0], 0), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0, len(gene_indices)), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    if len(train_observations) < n_components:
+        raise ValueError("PCA context dimension exceeds the number of training bins")
+
+    pca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
+    # IncrementalPCA requires every partial_fit batch to contain at least K rows.
+    fit_batch = max(batch_size, n_components)
+    stop = len(train_observations)
+    start = 0
+    while start < stop:
+        end = min(start + fit_batch, stop)
+        # Fold a too-small final remainder into the current batch so every
+        # observation is fitted exactly once.
+        if 0 < stop - end < n_components:
+            end = stop
+        observations = train_observations[start:end]
+        values = _normalized_expression_batch(
+            matrix, observations, gene_indices, library_size,
+            target_sum, gene_scale,
+        )
+        pca.partial_fit(values)
+        start = end
+
+    scores = np.empty((matrix.shape[0], n_components), dtype=np.float32)
+    all_observations = np.arange(matrix.shape[0], dtype=np.int64)
+    for start in range(0, len(all_observations), batch_size):
+        observations = all_observations[start:start + batch_size]
+        values = _normalized_expression_batch(
+            matrix, observations, gene_indices, library_size,
+            target_sum, gene_scale,
+        )
+        scores[observations] = pca.transform(values).astype(np.float32)
+    context_scale = np.sqrt(np.mean(scores[train_observations] ** 2, axis=0))
+    context_scale = np.maximum(context_scale.astype(np.float32), 1e-6)
+    scores /= context_scale[None, :]
+    return (
+        scores,
+        pca.mean_.astype(np.float32),
+        pca.components_.astype(np.float32),
+        context_scale,
+        pca.explained_variance_ratio_.astype(np.float32),
+    )
+
+
 @dataclass
 class VisiumHDPair:
     lr_matrix: sp.csc_matrix
@@ -145,6 +224,11 @@ class VisiumHDPair:
     split_axis: str
     scale: int
     target_sum: float
+    lr_context: np.ndarray
+    context_mean: np.ndarray
+    context_components: np.ndarray
+    context_scale: np.ndarray
+    context_explained_variance_ratio: np.ndarray
 
 
 def prepare_visium_hd_pair(
@@ -157,6 +241,7 @@ def prepare_visium_hd_pair(
     split_ratios: Sequence[float] = (0.7, 0.15, 0.15),
     h5_name: str = "raw_feature_bc_matrix.h5",
     positions_name: str = "spatial/tissue_positions.parquet",
+    context_dim: int = 0,
 ) -> VisiumHDPair:
     if split_axis not in {"row", "col"}:
         raise ValueError("split_axis must be 'row' or 'col'")
@@ -198,6 +283,13 @@ def prepare_visium_hd_pair(
     hr_scales = _gene_rms(
         hr_matrix_all, hr_train_obs, hr_gene_indices, hr_library, target_sum
     )
+    (
+        lr_context, context_mean, context_components, context_scale,
+        context_explained_variance_ratio,
+    ) = _fit_lr_pca_context(
+        lr_matrix_all, lr_train_obs, lr_gene_indices, lr_library,
+        target_sum, lr_scales, context_dim,
+    )
     return VisiumHDPair(
         lr_matrix=lr_matrix_all[:, lr_gene_indices].tocsc(),
         hr_matrix=hr_matrix_all[:, hr_gene_indices].tocsc(),
@@ -212,6 +304,11 @@ def prepare_visium_hd_pair(
         split_axis=split_axis,
         scale=scale,
         target_sum=target_sum,
+        lr_context=lr_context,
+        context_mean=context_mean,
+        context_components=context_components,
+        context_scale=context_scale,
+        context_explained_variance_ratio=context_explained_variance_ratio,
     )
 
 
@@ -224,13 +321,28 @@ class PairedVisiumHDDataset(Dataset):
         repeat: int = 20,
         min_tissue_fraction: float = 0.1,
         deterministic: bool = False,
+        origin_stride: Optional[int] = None,
+        max_origins: int = 0,
+        context_mode: str = "pca",
+        seed: int = 2026,
     ):
         self.pair = pair
         self.split = split
         self.patch_h, self.patch_w = patch_size_lr
         self.repeat = repeat
         self.deterministic = deterministic
+        if context_mode not in {"pca", "shuffled"}:
+            raise ValueError("context_mode must be 'pca' or 'shuffled'")
+        self.context_mode = context_mode
+        self.seed = seed
+        self.origin_stride = origin_stride
         self.origins = self._candidate_origins(min_tissue_fraction)
+        if max_origins > 0 and len(self.origins) > max_origins:
+            chosen = np.linspace(0, len(self.origins) - 1, max_origins).round().astype(int)
+            self.origins = [self.origins[index] for index in chosen]
+        self.context_permutation = np.arange(len(pair.lr_library), dtype=np.int64)
+        if context_mode == "shuffled" and pair.lr_context.shape[1]:
+            np.random.default_rng(seed).shuffle(self.context_permutation)
         if not self.origins:
             raise ValueError(f"No usable {split} patches; reduce patch size or tissue threshold")
 
@@ -243,7 +355,8 @@ class PairedVisiumHDDataset(Dataset):
         else:
             row_limits = (low, high)
             col_limits = (0, row_map.shape[1])
-        step_h, step_w = max(self.patch_h // 4, 1), max(self.patch_w // 4, 1)
+        stride = self.origin_stride or max(self.patch_h // 4, 1)
+        step_h, step_w = stride, stride
         origins = []
         for row in range(row_limits[0], row_limits[1] - self.patch_h + 1, step_h):
             for col in range(col_limits[0], col_limits[1] - self.patch_w + 1, step_w):
@@ -253,7 +366,24 @@ class PairedVisiumHDDataset(Dataset):
         return origins
 
     def __len__(self):
+        if self.deterministic:
+            return len(self.pair.genes) * len(self.origins)
         return len(self.pair.genes) * self.repeat
+
+    def _extract_context(self, row: int, col: int) -> np.ndarray:
+        channels = self.pair.lr_context.shape[1]
+        result = np.zeros((channels, self.patch_h, self.patch_w), dtype=np.float32)
+        if channels == 0:
+            return result
+        indices = self.pair.lr_row_map[
+            row:row + self.patch_h, col:col + self.patch_w
+        ]
+        valid = indices >= 0
+        observations = indices[valid]
+        if self.context_mode == "shuffled":
+            observations = self.context_permutation[observations]
+        result[:, valid] = self.pair.lr_context[observations].T
+        return result
 
     @staticmethod
     def _extract(
@@ -299,10 +429,12 @@ class PairedVisiumHDDataset(Dataset):
         )
         inp = inp / self.pair.lr_gene_scale[gene]
         gt = gt / self.pair.hr_gene_scale[gene]
+        context = self._extract_context(row_lr, col_lr)
         target_shape = (self.patch_h * scale, self.patch_w * scale)
         return {
             "inp": torch.from_numpy(inp).unsqueeze(0),
             "input_mask": torch.from_numpy(input_mask).unsqueeze(0),
+            "gene_context": torch.from_numpy(context),
             "gt": torch.from_numpy(gt).unsqueeze(0),
             "target_mask": torch.from_numpy(target_mask).unsqueeze(0),
             "hr_library": torch.from_numpy(hr_library).unsqueeze(0),

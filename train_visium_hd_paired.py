@@ -37,7 +37,16 @@ def parse_args():
     parser.add_argument("--target-sum", type=float, default=1e4)
     parser.add_argument("--patch-size-lr", type=int, default=32)
     parser.add_argument("--train-repeat", type=int, default=4)
-    parser.add_argument("--eval-repeat", type=int, default=1)
+    parser.add_argument("--eval-repeat", type=int, default=1,
+                        help="Deprecated compatibility option; deterministic evaluation covers origins")
+    parser.add_argument("--eval-origin-stride", type=int, default=0,
+                        help="LR stride for deterministic evaluation; 0 uses patch size")
+    parser.add_argument("--eval-max-origins", type=int, default=0,
+                        help="Evenly subsample evaluation origins; 0 evaluates all")
+    parser.add_argument("--context-dim", type=int, default=16,
+                        help="PCA gene-context channels; 0 reproduces the single-gene model")
+    parser.add_argument("--context-mode", choices=("pca", "shuffled"), default="pca",
+                        help="Use real context or a spatially shuffled negative control")
     parser.add_argument("--min-tissue-fraction", type=float, default=0.1)
     parser.add_argument("--split-axis", choices=("row", "col"), default="col")
     parser.add_argument("--split-ratios", type=float, nargs=3, default=(0.7, 0.15, 0.15))
@@ -71,7 +80,7 @@ def masked_smooth_l1(prediction, target, mask):
     return loss.sum() / mask.sum().clamp_min(1.0)
 
 
-def masked_pearson(prediction, target, mask):
+def masked_pearson_values(prediction, target, mask):
     batch = prediction.shape[0]
     values = []
     for index in range(batch):
@@ -86,8 +95,8 @@ def masked_pearson(prediction, target, mask):
         if denominator > 0:
             values.append((pred * truth).sum() / denominator)
     if not values:
-        return prediction.new_tensor(float("nan"))
-    return torch.stack(values).mean()
+        return prediction.new_empty(0)
+    return torch.stack(values)
 
 
 def aggregation_consistency_loss(
@@ -144,7 +153,9 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     totals = {"loss": 0.0, "reconstruction": 0.0, "consistency": 0.0,
-              "negative": 0.0, "pearson": 0.0, "batches": 0}
+              "negative": 0.0, "pearson_sum": 0.0, "pearson_count": 0,
+              "baseline_reconstruction": 0.0, "baseline_pearson_sum": 0.0,
+              "baseline_pearson_count": 0, "batches": 0}
     context = torch.enable_grad if training else torch.no_grad
     with context():
         progress = tqdm(loader, desc=description, leave=False)
@@ -156,6 +167,8 @@ def run_epoch(
                 prediction = model(
                     batch["inp"], batch["input_mask"], batch["coord"],
                     batch["cell"], batch["scale"], batch["target_mask"],
+                    batch["gene_context"],
+                    batch["lr_gene_scale"] / batch["hr_gene_scale"],
                 )
                 reconstruction = masked_smooth_l1(
                     prediction, batch["gt"], batch["target_mask"]
@@ -178,16 +191,48 @@ def run_epoch(
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-            pearson = masked_pearson(prediction.detach(), batch["gt"], batch["target_mask"])
+            baseline = F.grid_sample(
+                batch["inp"], batch["coord"].flip(-1), mode="bilinear",
+                padding_mode="border", align_corners=False,
+            )
+            # Input and target use separately fitted gene-wise RMS scales.
+            baseline = baseline * (
+                batch["lr_gene_scale"] / batch["hr_gene_scale"]
+            )[:, None, None, None]
+            pearsons = masked_pearson_values(
+                prediction.detach(), batch["gt"], batch["target_mask"]
+            )
+            baseline_pearsons = masked_pearson_values(
+                baseline, batch["gt"], batch["target_mask"]
+            )
+            baseline_reconstruction = masked_smooth_l1(
+                baseline, batch["gt"], batch["target_mask"]
+            )
             totals["loss"] += loss.item()
             totals["reconstruction"] += reconstruction.item()
             totals["consistency"] += consistency.item()
             totals["negative"] += negative.item()
-            totals["pearson"] += 0.0 if torch.isnan(pearson) else pearson.item()
+            totals["pearson_sum"] += pearsons.sum().item()
+            totals["pearson_count"] += pearsons.numel()
+            totals["baseline_reconstruction"] += baseline_reconstruction.item()
+            totals["baseline_pearson_sum"] += baseline_pearsons.sum().item()
+            totals["baseline_pearson_count"] += baseline_pearsons.numel()
             totals["batches"] += 1
             progress.set_postfix(loss=f"{totals['loss']/totals['batches']:.4f}")
     batches = max(totals.pop("batches"), 1)
-    return {key: value / batches for key, value in totals.items()}
+    pearson = totals.pop("pearson_sum") / max(totals.pop("pearson_count"), 1)
+    baseline_pearson = (
+        totals.pop("baseline_pearson_sum")
+        / max(totals.pop("baseline_pearson_count"), 1)
+    )
+    metrics = {key: value / batches for key, value in totals.items()}
+    metrics["pearson"] = pearson
+    metrics["baseline_pearson"] = baseline_pearson
+    metrics["pearson_gain"] = pearson - baseline_pearson
+    metrics["reconstruction_gain"] = (
+        metrics["baseline_reconstruction"] - metrics["reconstruction"]
+    )
+    return metrics
 
 
 def main():
@@ -206,21 +251,36 @@ def main():
         target_sum=args.target_sum,
         split_axis=args.split_axis,
         split_ratios=args.split_ratios,
+        context_dim=args.context_dim,
     )
     datasets = {
         "train": PairedVisiumHDDataset(
             pair, "train", (args.patch_size_lr, args.patch_size_lr),
             args.train_repeat, args.min_tissue_fraction, deterministic=False,
+            context_mode=args.context_mode, seed=args.seed,
         ),
         "val": PairedVisiumHDDataset(
             pair, "val", (args.patch_size_lr, args.patch_size_lr),
             args.eval_repeat, args.min_tissue_fraction, deterministic=True,
+            origin_stride=args.eval_origin_stride or args.patch_size_lr,
+            max_origins=args.eval_max_origins,
+            context_mode=args.context_mode, seed=args.seed,
         ),
         "test": PairedVisiumHDDataset(
             pair, "test", (args.patch_size_lr, args.patch_size_lr),
             args.eval_repeat, args.min_tissue_fraction, deterministic=True,
+            origin_stride=args.eval_origin_stride or args.patch_size_lr,
+            max_origins=args.eval_max_origins,
+            context_mode=args.context_mode, seed=args.seed,
         ),
     }
+    print(
+        "Evaluation origins:",
+        f"val={len(datasets['val'].origins)}, test={len(datasets['test'].origins)}",
+    )
+    if args.context_dim:
+        explained = float(pair.context_explained_variance_ratio.sum())
+        print(f"PCA context: {args.context_dim} dimensions, explained variance={explained:.4f}")
     loaders = {
         name: DataLoader(
             dataset,
@@ -237,6 +297,7 @@ def main():
         num_heads=args.num_heads,
         num_operator_layers=args.operator_layers,
         encoder_blocks=args.encoder_blocks,
+        context_dim=args.context_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -252,6 +313,10 @@ def main():
         genes=pair.genes,
         lr_scale=pair.lr_gene_scale,
         hr_scale=pair.hr_gene_scale,
+        context_mean=pair.context_mean,
+        context_components=pair.context_components,
+        context_scale=pair.context_scale,
+        context_explained_variance_ratio=pair.context_explained_variance_ratio,
     )
     config = vars(args).copy()
     config["output_dir"] = str(config["output_dir"])

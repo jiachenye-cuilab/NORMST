@@ -59,13 +59,15 @@ class STSRNO(nn.Module):
         num_heads: int = 16,
         num_operator_layers: int = 2,
         encoder_blocks: int = 16,
+        context_dim: int = 0,
     ):
         super().__init__()
         self.width = width
         # Channel 0 is expression; channel 1 explicitly distinguishes valid
         # tissue observations from biological zeros and padding.
+        self.context_dim = context_dim
         self.encoder = make_edsr_baseline(
-            n_resblocks=encoder_blocks, n_feats=64, n_colors=2
+            n_resblocks=encoder_blocks, n_feats=64, n_colors=2 + context_dim
         )
         self.lifting = nn.Conv2d((64 + 2) * 4 + 2, width, 1)
         self.scale_conditioner = nn.Sequential(
@@ -144,8 +146,18 @@ class STSRNO(nn.Module):
         cell: torch.Tensor,
         scale: torch.Tensor,
         target_mask: Optional[torch.Tensor] = None,
+        gene_context: Optional[torch.Tensor] = None,
+        baseline_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        feat = self.encoder(torch.cat([expression, input_mask], dim=1))
+        if gene_context is None:
+            gene_context = expression.new_zeros(
+                expression.shape[0], self.context_dim, *expression.shape[-2:]
+            )
+        if gene_context.shape[1] != self.context_dim:
+            raise ValueError(
+                f"Expected {self.context_dim} context channels, got {gene_context.shape[1]}"
+            )
+        feat = self.encoder(torch.cat([expression, input_mask, gene_context], dim=1))
         latent = self.lifting(self._query_features(feat, coord, cell))
         scale_feature = torch.log2(scale.clamp_min(1.0)).reshape(-1, 1)
         gamma, beta = self.scale_conditioner(scale_feature).chunk(2, dim=1)
@@ -160,4 +172,6 @@ class STSRNO(nn.Module):
             padding_mode="border",
             align_corners=False,
         )
+        if baseline_scale is not None:
+            baseline = baseline * baseline_scale[:, None, None, None]
         return residual + self.skip_calibration(baseline)
