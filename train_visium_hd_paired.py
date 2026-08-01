@@ -59,6 +59,16 @@ def parse_args():
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--operator-layers", type=int, default=2)
     parser.add_argument("--encoder-blocks", type=int, default=16)
+    parser.add_argument("--gene-embedding-dim", type=int, default=16,
+                        help="Target-gene embedding channels; 0 disables gene identity")
+    parser.add_argument("--positive-patch-fraction", type=float, default=0.5,
+                        help="Fraction of training samples that seek a positive HR patch")
+    parser.add_argument("--positive-sampling-attempts", type=int, default=8)
+    parser.add_argument("--positive-loss-weight", type=float, default=0.5,
+                        help="Weight of positive pixels in balanced reconstruction loss")
+    parser.add_argument("--reconstruction-loss", choices=("balanced", "standard"),
+                        default="balanced")
+    parser.add_argument("--lambda-pearson", type=float, default=0.05)
     parser.add_argument("--lambda-consistency", type=float, default=0.1)
     parser.add_argument("--lambda-negative", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=2026)
@@ -78,6 +88,54 @@ def seed_everything(seed: int):
 def masked_smooth_l1(prediction, target, mask):
     loss = F.smooth_l1_loss(prediction, target, reduction="none") * mask
     return loss.sum() / mask.sum().clamp_min(1.0)
+
+
+def balanced_masked_smooth_l1(
+    prediction, target, mask, positive_weight=0.5
+):
+    """Average positive and zero pixels separately before combining them."""
+    if not 0.0 <= positive_weight <= 1.0:
+        raise ValueError("positive_weight must be between 0 and 1")
+    elementwise = F.smooth_l1_loss(prediction, target, reduction="none")
+    valid = mask.bool()
+    positive = valid & (target > 0)
+    zero = valid & ~positive
+    terms, weights = [], []
+    if positive.any():
+        terms.append(elementwise[positive].mean())
+        weights.append(positive_weight)
+    if zero.any():
+        terms.append(elementwise[zero].mean())
+        weights.append(1.0 - positive_weight)
+    if not terms:
+        return prediction.sum() * 0.0
+    weight_sum = sum(weights)
+    if weight_sum <= 0:
+        return sum(terms) / len(terms)
+    return sum(term * weight for term, weight in zip(terms, weights)) / weight_sum
+
+
+def masked_pearson_loss(prediction, target, mask, epsilon=1e-8):
+    """Differentiable mean 1-Pearson over samples with variable targets."""
+    losses = []
+    for index in range(prediction.shape[0]):
+        valid = mask[index].bool()
+        pred = prediction[index][valid]
+        truth = target[index][valid]
+        if pred.numel() < 2:
+            continue
+        pred = pred - pred.mean()
+        truth = truth - truth.mean()
+        truth_energy = truth.square().sum()
+        if truth_energy <= epsilon:
+            continue
+        denominator = torch.sqrt(
+            pred.square().sum().clamp_min(epsilon) * truth_energy
+        )
+        losses.append(1.0 - (pred * truth).sum() / denominator)
+    if not losses:
+        return prediction.sum() * 0.0
+    return torch.stack(losses).mean()
 
 
 def masked_pearson_values(prediction, target, mask):
@@ -145,6 +203,9 @@ def run_epoch(
     target_sum,
     lambda_consistency,
     lambda_negative,
+    lambda_pearson,
+    positive_loss_weight,
+    reconstruction_loss,
     optimizer=None,
     scaler=None,
     use_amp=True,
@@ -152,7 +213,9 @@ def run_epoch(
 ):
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "reconstruction": 0.0, "consistency": 0.0,
+    totals = {"loss": 0.0, "reconstruction": 0.0,
+              "balanced_reconstruction": 0.0, "pearson_loss": 0.0,
+              "consistency": 0.0,
               "negative": 0.0, "pearson_sum": 0.0, "pearson_count": 0,
               "baseline_reconstruction": 0.0, "baseline_pearson_sum": 0.0,
               "baseline_pearson_count": 0, "batches": 0}
@@ -169,8 +232,16 @@ def run_epoch(
                     batch["cell"], batch["scale"], batch["target_mask"],
                     batch["gene_context"],
                     batch["lr_gene_scale"] / batch["hr_gene_scale"],
+                    batch["gene_index"],
                 )
                 reconstruction = masked_smooth_l1(
+                    prediction, batch["gt"], batch["target_mask"]
+                )
+                balanced_reconstruction = balanced_masked_smooth_l1(
+                    prediction, batch["gt"], batch["target_mask"],
+                    positive_weight=positive_loss_weight,
+                )
+                pearson_loss = masked_pearson_loss(
                     prediction, batch["gt"], batch["target_mask"]
                 )
                 consistency = aggregation_consistency_loss(
@@ -182,8 +253,14 @@ def run_epoch(
                 negative = (
                     F.relu(-prediction) * batch["target_mask"]
                 ).sum() / batch["target_mask"].sum().clamp_min(1.0)
+                reconstruction_objective = (
+                    balanced_reconstruction
+                    if reconstruction_loss == "balanced"
+                    else reconstruction
+                )
                 loss = (
-                    reconstruction
+                    reconstruction_objective
+                    + lambda_pearson * pearson_loss
                     + lambda_consistency * consistency
                     + lambda_negative * negative
                 )
@@ -210,6 +287,8 @@ def run_epoch(
             )
             totals["loss"] += loss.item()
             totals["reconstruction"] += reconstruction.item()
+            totals["balanced_reconstruction"] += balanced_reconstruction.item()
+            totals["pearson_loss"] += pearson_loss.item()
             totals["consistency"] += consistency.item()
             totals["negative"] += negative.item()
             totals["pearson_sum"] += pearsons.sum().item()
@@ -237,6 +316,16 @@ def run_epoch(
 
 def main():
     args = parse_args()
+    if args.gene_embedding_dim < 0:
+        raise ValueError("gene_embedding_dim must be non-negative")
+    if not 0.0 <= args.positive_patch_fraction <= 1.0:
+        raise ValueError("positive_patch_fraction must be between 0 and 1")
+    if args.positive_sampling_attempts < 1:
+        raise ValueError("positive_sampling_attempts must be at least 1")
+    if not 0.0 <= args.positive_loss_weight <= 1.0:
+        raise ValueError("positive_loss_weight must be between 0 and 1")
+    if args.lambda_pearson < 0:
+        raise ValueError("lambda_pearson must be non-negative")
     seed_everything(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda" and not args.no_amp
@@ -258,6 +347,8 @@ def main():
             pair, "train", (args.patch_size_lr, args.patch_size_lr),
             args.train_repeat, args.min_tissue_fraction, deterministic=False,
             context_mode=args.context_mode, seed=args.seed,
+            positive_patch_fraction=args.positive_patch_fraction,
+            positive_sampling_attempts=args.positive_sampling_attempts,
         ),
         "val": PairedVisiumHDDataset(
             pair, "val", (args.patch_size_lr, args.patch_size_lr),
@@ -298,6 +389,8 @@ def main():
         num_operator_layers=args.operator_layers,
         encoder_blocks=args.encoder_blocks,
         context_dim=args.context_dim,
+        n_genes=len(pair.genes),
+        gene_embedding_dim=args.gene_embedding_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -330,12 +423,16 @@ def main():
         train_metrics = run_epoch(
             model, loaders["train"], device, args.target_sum,
             args.lambda_consistency, args.lambda_negative,
+            args.lambda_pearson, args.positive_loss_weight,
+            args.reconstruction_loss,
             optimizer=optimizer, scaler=scaler, use_amp=use_amp,
             description=f"train {epoch + 1}/{args.epochs}",
         )
         val_metrics = run_epoch(
             model, loaders["val"], device, args.target_sum,
             args.lambda_consistency, args.lambda_negative,
+            args.lambda_pearson, args.positive_loss_weight,
+            args.reconstruction_loss,
             use_amp=use_amp, description=f"val {epoch + 1}/{args.epochs}",
         )
         scheduler.step()
@@ -366,6 +463,8 @@ def main():
     test_metrics = run_epoch(
         model, loaders["test"], device, args.target_sum,
         args.lambda_consistency, args.lambda_negative,
+        args.lambda_pearson, args.positive_loss_weight,
+        args.reconstruction_loss,
         use_amp=use_amp, description="test",
     )
     (args.output_dir / "test_metrics.json").write_text(

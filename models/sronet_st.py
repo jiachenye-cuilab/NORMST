@@ -60,14 +60,27 @@ class STSRNO(nn.Module):
         num_operator_layers: int = 2,
         encoder_blocks: int = 16,
         context_dim: int = 0,
+        n_genes: int = 0,
+        gene_embedding_dim: int = 0,
     ):
         super().__init__()
         self.width = width
         # Channel 0 is expression; channel 1 explicitly distinguishes valid
         # tissue observations from biological zeros and padding.
         self.context_dim = context_dim
+        self.gene_embedding_dim = gene_embedding_dim
+        if gene_embedding_dim < 0:
+            raise ValueError("gene_embedding_dim must be non-negative")
+        if gene_embedding_dim > 0:
+            if n_genes <= 0:
+                raise ValueError("n_genes must be positive when using gene embeddings")
+            self.gene_embedding = nn.Embedding(n_genes, gene_embedding_dim)
+        else:
+            self.gene_embedding = None
         self.encoder = make_edsr_baseline(
-            n_resblocks=encoder_blocks, n_feats=64, n_colors=2 + context_dim
+            n_resblocks=encoder_blocks,
+            n_feats=64,
+            n_colors=2 + context_dim + gene_embedding_dim,
         )
         self.lifting = nn.Conv2d((64 + 2) * 4 + 2, width, 1)
         self.scale_conditioner = nn.Sequential(
@@ -148,6 +161,7 @@ class STSRNO(nn.Module):
         target_mask: Optional[torch.Tensor] = None,
         gene_context: Optional[torch.Tensor] = None,
         baseline_scale: Optional[torch.Tensor] = None,
+        gene_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if gene_context is None:
             gene_context = expression.new_zeros(
@@ -157,7 +171,16 @@ class STSRNO(nn.Module):
             raise ValueError(
                 f"Expected {self.context_dim} context channels, got {gene_context.shape[1]}"
             )
-        feat = self.encoder(torch.cat([expression, input_mask, gene_context], dim=1))
+        encoder_inputs = [expression, input_mask, gene_context]
+        if self.gene_embedding is not None:
+            if gene_index is None:
+                raise ValueError("gene_index is required when using gene embeddings")
+            embedding = self.gene_embedding(gene_index).to(expression.dtype)
+            embedding = embedding[:, :, None, None].expand(
+                -1, -1, *expression.shape[-2:]
+            )
+            encoder_inputs.append(embedding)
+        feat = self.encoder(torch.cat(encoder_inputs, dim=1))
         latent = self.lifting(self._query_features(feat, coord, cell))
         scale_feature = torch.log2(scale.clamp_min(1.0)).reshape(-1, 1)
         gamma, beta = self.scale_conditioner(scale_feature).chunk(2, dim=1)

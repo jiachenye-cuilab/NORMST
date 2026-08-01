@@ -325,6 +325,8 @@ class PairedVisiumHDDataset(Dataset):
         max_origins: int = 0,
         context_mode: str = "pca",
         seed: int = 2026,
+        positive_patch_fraction: float = 0.0,
+        positive_sampling_attempts: int = 8,
     ):
         self.pair = pair
         self.split = split
@@ -335,6 +337,12 @@ class PairedVisiumHDDataset(Dataset):
             raise ValueError("context_mode must be 'pca' or 'shuffled'")
         self.context_mode = context_mode
         self.seed = seed
+        if not 0.0 <= positive_patch_fraction <= 1.0:
+            raise ValueError("positive_patch_fraction must be between 0 and 1")
+        if positive_sampling_attempts < 1:
+            raise ValueError("positive_sampling_attempts must be at least 1")
+        self.positive_patch_fraction = positive_patch_fraction
+        self.positive_sampling_attempts = positive_sampling_attempts
         self.origin_stride = origin_stride
         self.origins = self._candidate_origins(min_tissue_fraction)
         if max_origins > 0 and len(self.origins) > max_origins:
@@ -410,14 +418,41 @@ class PairedVisiumHDDataset(Dataset):
             lib_grid[valid] = library[obs]
         return values, valid.astype(np.float32), lib_grid
 
+    def _has_positive_hr(self, gene: int, origin: Tuple[int, int]) -> bool:
+        """Check positivity without densifying an HR patch."""
+        scale = self.pair.scale
+        row, col = origin
+        indices = self.pair.hr_row_map[
+            row * scale:(row + self.patch_h) * scale,
+            col * scale:(col + self.patch_w) * scale,
+        ]
+        observations = indices[indices >= 0]
+        return bool(
+            len(observations)
+            and self.pair.hr_matrix[observations, gene].nnz > 0
+        )
+
     def __getitem__(self, index):
         gene = index % len(self.pair.genes)
         if self.deterministic:
             origin = self.origins[(index // len(self.pair.genes)) % len(self.origins)]
         else:
             origin = random.choice(self.origins)
-        row_lr, col_lr = origin
         scale = self.pair.scale
+        # Enrich training with patches containing at least one positive HR
+        # observation for the sampled target gene. Validation and test remain
+        # deterministic and retain the natural zero/positive distribution.
+        seek_positive = (
+            not self.deterministic
+            and random.random() < self.positive_patch_fraction
+        )
+        if seek_positive:
+            for _ in range(self.positive_sampling_attempts):
+                candidate = random.choice(self.origins)
+                origin = candidate
+                if self._has_positive_hr(gene, candidate):
+                    break
+        row_lr, col_lr = origin
         inp, input_mask, _ = self._extract(
             self.pair.lr_matrix, self.pair.lr_library, self.pair.lr_row_map,
             gene, row_lr, col_lr, self.patch_h, self.patch_w, self.pair.target_sum,
