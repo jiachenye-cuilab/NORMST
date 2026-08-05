@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from models.edsr import make_edsr_baseline
+from models.hex_encoder import HexSpatialEncoder
 from utils import make_coord
 
 
@@ -62,6 +63,8 @@ class STSRNO(nn.Module):
         context_dim: int = 0,
         n_genes: int = 0,
         gene_embedding_dim: int = 0,
+        include_tissue_mask: bool = False,
+        spatial_encoder: str = "rectangular",
     ):
         super().__init__()
         self.width = width
@@ -69,6 +72,15 @@ class STSRNO(nn.Module):
         # tissue observations from biological zeros and padding.
         self.context_dim = context_dim
         self.gene_embedding_dim = gene_embedding_dim
+        self.include_tissue_mask = include_tissue_mask
+        if spatial_encoder not in {
+            "rectangular", "rectangular_coord", "hex_coord"
+        }:
+            raise ValueError(
+                "spatial_encoder must be rectangular, rectangular_coord, or hex_coord"
+            )
+        self.spatial_encoder = spatial_encoder
+        self.use_physical_coordinates = spatial_encoder != "rectangular"
         if gene_embedding_dim < 0:
             raise ValueError("gene_embedding_dim must be non-negative")
         if gene_embedding_dim > 0:
@@ -77,11 +89,23 @@ class STSRNO(nn.Module):
             self.gene_embedding = nn.Embedding(n_genes, gene_embedding_dim)
         else:
             self.gene_embedding = None
-        self.encoder = make_edsr_baseline(
-            n_resblocks=encoder_blocks,
-            n_feats=64,
-            n_colors=2 + context_dim + gene_embedding_dim,
+        encoder_channels = (
+            2 + context_dim + gene_embedding_dim
+            + int(include_tissue_mask)
+            + 2 * int(self.use_physical_coordinates)
         )
+        if spatial_encoder == "hex_coord":
+            self.encoder = HexSpatialEncoder(
+                in_channels=encoder_channels,
+                channels=64,
+                blocks=encoder_blocks,
+            )
+        else:
+            self.encoder = make_edsr_baseline(
+                n_resblocks=encoder_blocks,
+                n_feats=64,
+                n_colors=encoder_channels,
+            )
         self.lifting = nn.Conv2d((64 + 2) * 4 + 2, width, 1)
         self.scale_conditioner = nn.Sequential(
             nn.Linear(1, 64), nn.GELU(), nn.Linear(64, 2 * width)
@@ -162,6 +186,9 @@ class STSRNO(nn.Module):
         gene_context: Optional[torch.Tensor] = None,
         baseline_scale: Optional[torch.Tensor] = None,
         gene_index: Optional[torch.Tensor] = None,
+        tissue_mask: Optional[torch.Tensor] = None,
+        physical_coord: Optional[torch.Tensor] = None,
+        row_parity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if gene_context is None:
             gene_context = expression.new_zeros(
@@ -172,6 +199,10 @@ class STSRNO(nn.Module):
                 f"Expected {self.context_dim} context channels, got {gene_context.shape[1]}"
             )
         encoder_inputs = [expression, input_mask, gene_context]
+        if self.include_tissue_mask:
+            if tissue_mask is None:
+                raise ValueError("tissue_mask is required by this model")
+            encoder_inputs.append(tissue_mask)
         if self.gene_embedding is not None:
             if gene_index is None:
                 raise ValueError("gene_index is required when using gene embeddings")
@@ -180,7 +211,20 @@ class STSRNO(nn.Module):
                 -1, -1, *expression.shape[-2:]
             )
             encoder_inputs.append(embedding)
-        feat = self.encoder(torch.cat(encoder_inputs, dim=1))
+        if self.use_physical_coordinates:
+            if physical_coord is None:
+                raise ValueError("physical_coord is required by this spatial encoder")
+            if physical_coord.shape[1] != 2:
+                raise ValueError("physical_coord must contain x and y channels")
+            encoder_inputs.append(physical_coord.to(expression.dtype))
+        encoder_input = torch.cat(encoder_inputs, dim=1)
+        if self.spatial_encoder == "hex_coord":
+            if row_parity is None:
+                raise ValueError("row_parity is required by the hex encoder")
+            encoder_mask = tissue_mask if tissue_mask is not None else input_mask
+            feat = self.encoder(encoder_input, encoder_mask, row_parity)
+        else:
+            feat = self.encoder(encoder_input)
         latent = self.lifting(self._query_features(feat, coord, cell))
         scale_feature = torch.log2(scale.clamp_min(1.0)).reshape(-1, 1)
         gamma, beta = self.scale_conditioner(scale_feature).chunk(2, dim=1)
