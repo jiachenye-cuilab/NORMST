@@ -45,6 +45,12 @@ def parse_args():
             "six-neighbor residual message passing"
         ),
     )
+    parser.add_argument(
+        "--hex-residual-scale",
+        type=float,
+        default=0.1,
+        help="Residual-branch scale used only by the hexagonal encoder",
+    )
     parser.add_argument("--idw-neighbors", type=int, default=8)
     parser.add_argument("--reconstruction-loss", choices=("standard", "balanced"),
                         default="standard")
@@ -216,6 +222,13 @@ def run_epoch(
                     + lambda_pearson * pearson_loss
                     + lambda_negative * negative
                 )
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(
+                    f"{description}: non-finite loss; "
+                    f"prediction_finite={torch.isfinite(prediction).all().item()}, "
+                    f"reconstruction={reconstruction.item()}, "
+                    f"pearson_loss={pearson_loss.item()}, negative={negative.item()}"
+                )
             if training:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -264,6 +277,8 @@ def main():
     args = parse_args()
     if args.context_dim < 0 or args.gene_embedding_dim < 0:
         raise ValueError("context and embedding dimensions must be non-negative")
+    if args.hex_residual_scale < 0:
+        raise ValueError("hex residual scale must be non-negative")
     if not 0.0 <= args.positive_loss_weight <= 1.0:
         raise ValueError("positive_loss_weight must be between 0 and 1")
     if min(args.lambda_pearson, args.lambda_negative) < 0:
@@ -328,6 +343,7 @@ def main():
         gene_embedding_dim=args.gene_embedding_dim,
         include_tissue_mask=True,
         spatial_encoder=args.spatial_encoder,
+        hex_residual_scale=args.hex_residual_scale,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay

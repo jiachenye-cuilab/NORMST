@@ -65,6 +65,7 @@ class STSRNO(nn.Module):
         gene_embedding_dim: int = 0,
         include_tissue_mask: bool = False,
         spatial_encoder: str = "rectangular",
+        hex_residual_scale: float = 0.1,
     ):
         super().__init__()
         self.width = width
@@ -99,6 +100,7 @@ class STSRNO(nn.Module):
                 in_channels=encoder_channels,
                 channels=64,
                 blocks=encoder_blocks,
+                residual_scale=hex_residual_scale,
             )
         else:
             self.encoder = make_edsr_baseline(

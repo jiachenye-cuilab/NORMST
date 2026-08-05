@@ -68,35 +68,70 @@ class HexConv2d(nn.Module):
 
         left = _shift_to_neighbor(masked, 0, -1)
         right = _shift_to_neighbor(masked, 0, 1)
+        left_mask = _shift_to_neighbor(mask, 0, -1)
+        right_mask = _shift_to_neighbor(mask, 0, 1)
         upper_left = (
             even * _shift_to_neighbor(masked, -1, -1)
             + odd * _shift_to_neighbor(masked, -1, 0)
+        )
+        upper_left_mask = (
+            even * _shift_to_neighbor(mask, -1, -1)
+            + odd * _shift_to_neighbor(mask, -1, 0)
         )
         upper_right = (
             even * _shift_to_neighbor(masked, -1, 0)
             + odd * _shift_to_neighbor(masked, -1, 1)
         )
+        upper_right_mask = (
+            even * _shift_to_neighbor(mask, -1, 0)
+            + odd * _shift_to_neighbor(mask, -1, 1)
+        )
         lower_left = (
             even * _shift_to_neighbor(masked, 1, -1)
             + odd * _shift_to_neighbor(masked, 1, 0)
+        )
+        lower_left_mask = (
+            even * _shift_to_neighbor(mask, 1, -1)
+            + odd * _shift_to_neighbor(mask, 1, 0)
         )
         lower_right = (
             even * _shift_to_neighbor(masked, 1, 0)
             + odd * _shift_to_neighbor(masked, 1, 1)
         )
+        lower_right_mask = (
+            even * _shift_to_neighbor(mask, 1, 0)
+            + odd * _shift_to_neighbor(mask, 1, 1)
+        )
 
         output = self.center(masked)
+        neighbor_values = (
+            left, right, upper_left, upper_right, lower_left, lower_right
+        )
+        neighbor_masks = (
+            left_mask, right_mask, upper_left_mask, upper_right_mask,
+            lower_left_mask, lower_right_mask,
+        )
         for projection, neighbor in zip(
             self.neighbors,
-            (left, right, upper_left, upper_right, lower_left, lower_right),
+            neighbor_values,
         ):
             output = output + projection(neighbor)
+        # The seven projections are initialized independently. Normalize by
+        # the square root of the actual contributor count to preserve feature
+        # variance at both interior spots and irregular tissue boundaries.
+        contributors = mask
+        for neighbor_mask in neighbor_masks:
+            contributors = contributors + neighbor_mask
+        output = output / contributors.clamp_min(1.0).sqrt()
         return output * mask
 
 
 class HexResidualBlock(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, residual_scale: float = 0.1):
         super().__init__()
+        if residual_scale < 0:
+            raise ValueError("residual_scale must be non-negative")
+        self.residual_scale = residual_scale
         self.conv1 = HexConv2d(channels, channels)
         self.activation = nn.ReLU(inplace=True)
         self.conv2 = HexConv2d(channels, channels)
@@ -105,17 +140,23 @@ class HexResidualBlock(nn.Module):
         residual = self.conv1(x, tissue_mask, row_parity)
         residual = self.activation(residual)
         residual = self.conv2(residual, tissue_mask, row_parity)
-        return (x + residual) * tissue_mask
+        return (x + self.residual_scale * residual) * tissue_mask
 
 
 class HexSpatialEncoder(nn.Module):
     """EDSR-like residual encoder using the true six-neighbor topology."""
 
-    def __init__(self, in_channels: int, channels: int = 64, blocks: int = 16):
+    def __init__(
+        self,
+        in_channels: int,
+        channels: int = 64,
+        blocks: int = 16,
+        residual_scale: float = 0.1,
+    ):
         super().__init__()
         self.head = nn.Conv2d(in_channels, channels, 1)
         self.blocks = nn.ModuleList([
-            HexResidualBlock(channels) for _ in range(blocks)
+            HexResidualBlock(channels, residual_scale) for _ in range(blocks)
         ])
         self.body = HexConv2d(channels, channels)
 
