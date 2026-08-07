@@ -24,7 +24,7 @@ from models.sronet_st import STSRNO
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--count-file", default="raw_feature_bc_matrix.h5")
+    parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--n-genes", type=int, default=1000)
     parser.add_argument("--target-sum", type=float, default=1e4)
@@ -50,6 +50,30 @@ def parse_args():
         type=float,
         default=0.1,
         help="Residual-branch scale used only by the hexagonal encoder",
+    )
+    parser.add_argument(
+        "--query-mode",
+        choices=("rectangular", "physical"),
+        default="rectangular",
+        help=(
+            "rectangular keeps the original four-neighbor grid query; "
+            "physical aggregates nearest observed spots using true coordinates"
+        ),
+    )
+    parser.add_argument(
+        "--physical-query-neighbors",
+        type=int,
+        default=6,
+        help="Nearest currently observed spots aggregated by physical query",
+    )
+    parser.add_argument(
+        "--physical-query-candidate-multiplier",
+        type=int,
+        default=8,
+        help=(
+            "Precompute this multiple of physical-query neighbors so enough "
+            "candidates remain after dynamic training masks"
+        ),
     )
     parser.add_argument("--idw-neighbors", type=int, default=8)
     parser.add_argument("--reconstruction-loss", choices=("standard", "balanced"),
@@ -279,6 +303,11 @@ def main():
         raise ValueError("context and embedding dimensions must be non-negative")
     if args.hex_residual_scale < 0:
         raise ValueError("hex residual scale must be non-negative")
+    if min(
+        args.physical_query_neighbors,
+        args.physical_query_candidate_multiplier,
+    ) < 1:
+        raise ValueError("physical query sizes must be positive")
     if not 0.0 <= args.positive_loss_weight <= 1.0:
         raise ValueError("positive_loss_weight must be between 0 and 1")
     if min(args.lambda_pearson, args.lambda_negative) < 0:
@@ -299,6 +328,11 @@ def main():
         context_dim=args.context_dim,
         observed_fraction=args.observed_fraction,
         validation_fraction=args.validation_fraction,
+        build_physical_query_graph=args.query_mode == "physical",
+        physical_query_neighbors=args.physical_query_neighbors,
+        physical_query_candidate_multiplier=(
+            args.physical_query_candidate_multiplier
+        ),
         seed=args.seed,
     )
     print(
@@ -344,7 +378,16 @@ def main():
         include_tissue_mask=True,
         spatial_encoder=args.spatial_encoder,
         hex_residual_scale=args.hex_residual_scale,
-    ).to(device)
+        query_mode=args.query_mode,
+        physical_query_neighbors=args.physical_query_neighbors,
+    )
+    if args.query_mode == "physical":
+        model.set_physical_query_graph(
+            torch.from_numpy(data.physical_query_indices),
+            torch.from_numpy(data.physical_query_relative),
+            torch.from_numpy(data.physical_query_mask),
+        )
+    model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -379,6 +422,9 @@ def main():
         row_map=data.row_map,
         physical_coord_grid=data.physical_coord_grid,
         row_parity=data.row_parity,
+        physical_query_indices=data.physical_query_indices,
+        physical_query_relative=data.physical_query_relative,
+        physical_query_mask=data.physical_query_mask,
         observed_spots=data.observed_spots,
         validation_spots=data.validation_spots,
         test_spots=data.test_spots,

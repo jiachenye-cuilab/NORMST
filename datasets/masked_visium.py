@@ -35,6 +35,9 @@ class MaskedVisiumData:
     physical_xy: np.ndarray
     physical_coord_grid: np.ndarray
     row_parity: np.ndarray
+    physical_query_indices: np.ndarray
+    physical_query_relative: np.ndarray
+    physical_query_mask: np.ndarray
     observed_spots: np.ndarray
     validation_spots: np.ndarray
     test_spots: np.ndarray
@@ -143,6 +146,85 @@ def _spot_geometry(adata):
     )
 
 
+def _physical_query_graph(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    physical_xy: np.ndarray,
+    grid_shape: Tuple[int, int],
+    neighbors: int,
+    candidate_multiplier: int,
+):
+    """Precompute physical-neighbor candidates for every in-tissue spot.
+
+    The graph excludes the query spot itself. At runtime the model further
+    removes candidates whose expression is hidden by the current input mask,
+    then keeps the nearest requested neighbors. Relative displacements are
+    normalized by the median first-neighbor spacing so one unit is roughly one
+    Visium spot separation.
+    """
+    if neighbors < 1 or candidate_multiplier < 1:
+        raise ValueError("physical query sizes must be positive")
+    n_spots = len(physical_xy)
+    if n_spots <= neighbors:
+        raise ValueError("Not enough spots for the requested physical query")
+    if not np.isfinite(physical_xy).all():
+        raise ValueError("Physical spot coordinates contain non-finite values")
+
+    candidate_count = min(
+        n_spots - 1,
+        max(neighbors, neighbors * candidate_multiplier),
+    )
+    tree = cKDTree(physical_xy)
+    distances, spot_indices = tree.query(
+        physical_xy,
+        k=candidate_count + 1,
+    )
+    if distances.ndim == 1:
+        distances = distances[:, None]
+        spot_indices = spot_indices[:, None]
+
+    # cKDTree normally returns self first, but remove it explicitly so the
+    # construction remains correct in the presence of tied distances.
+    candidate_spots = np.empty((n_spots, candidate_count), dtype=np.int64)
+    candidate_distances = np.empty((n_spots, candidate_count), dtype=np.float32)
+    for spot in range(n_spots):
+        keep = spot_indices[spot] != spot
+        selected = spot_indices[spot][keep][:candidate_count]
+        selected_distances = distances[spot][keep][:candidate_count]
+        if len(selected) != candidate_count:
+            raise ValueError("Could not construct enough physical query candidates")
+        candidate_spots[spot] = selected
+        candidate_distances[spot] = selected_distances
+
+    spacing = float(np.median(candidate_distances[:, 0]))
+    if not np.isfinite(spacing):
+        raise ValueError("Could not estimate a finite physical spot spacing")
+    spacing = max(spacing, 1e-6)
+    relative_xy = (
+        physical_xy[:, None, :] - physical_xy[candidate_spots]
+    ) / spacing
+    relative_distance = np.linalg.norm(relative_xy, axis=-1, keepdims=True)
+    relative = np.concatenate(
+        [relative_xy, relative_distance], axis=-1
+    ).astype(np.float32)
+
+    height, width = grid_shape
+    flat_indices = (
+        rows[candidate_spots] * width + cols[candidate_spots]
+    ).astype(np.int64)
+    index_grid = np.zeros((height, width, candidate_count), dtype=np.int64)
+    relative_grid = np.zeros(
+        (3, height, width, candidate_count), dtype=np.float32
+    )
+    mask_grid = np.zeros(
+        (1, height, width, candidate_count), dtype=np.float32
+    )
+    index_grid[rows, cols] = flat_indices
+    relative_grid[:, rows, cols, :] = relative.transpose(2, 0, 1)
+    mask_grid[:, rows, cols, :] = 1.0
+    return index_grid, relative_grid, mask_grid
+
+
 def prepare_masked_visium(
     data_dir: str,
     count_file: str = "raw_feature_bc_matrix.h5",
@@ -151,6 +233,9 @@ def prepare_masked_visium(
     context_dim: int = 16,
     observed_fraction: float = 0.5,
     validation_fraction: float = 0.5,
+    build_physical_query_graph: bool = False,
+    physical_query_neighbors: int = 6,
+    physical_query_candidate_multiplier: int = 8,
     seed: int = 2026,
 ) -> MaskedVisiumData:
     """Load one slice and reserve spots before fitting any expression statistic."""
@@ -165,6 +250,23 @@ def prepare_masked_visium(
     (
         rows, cols, row_map, physical_xy, physical_coord_grid, row_parity
     ) = _spot_geometry(adata)
+    if build_physical_query_graph:
+        (
+            physical_query_indices,
+            physical_query_relative,
+            physical_query_mask,
+        ) = _physical_query_graph(
+            rows,
+            cols,
+            physical_xy,
+            row_map.shape,
+            physical_query_neighbors,
+            physical_query_candidate_multiplier,
+        )
+    else:
+        physical_query_indices = np.empty((0,), dtype=np.int64)
+        physical_query_relative = np.empty((0,), dtype=np.float32)
+        physical_query_mask = np.empty((0,), dtype=np.float32)
 
     rng = np.random.default_rng(seed)
     if np.isclose(observed_fraction, 0.5):
@@ -230,6 +332,9 @@ def prepare_masked_visium(
         physical_xy=physical_xy,
         physical_coord_grid=physical_coord_grid,
         row_parity=row_parity,
+        physical_query_indices=physical_query_indices,
+        physical_query_relative=physical_query_relative,
+        physical_query_mask=physical_query_mask,
         observed_spots=np.sort(observed_spots),
         validation_spots=validation_spots,
         test_spots=test_spots,
