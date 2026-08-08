@@ -168,7 +168,9 @@ def run_epoch(
             batch = move_batch(batch, device)
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(
+                device_type=device.type, enabled=use_amp
+            ):
                 full_prediction = model(
                     batch["inp"], batch["input_mask"]
                 )
@@ -275,7 +277,7 @@ def run_epoch(
 def collect_test_predictions(model, loader, device, use_amp):
     model.eval()
     batch = move_batch(next(iter(loader)), device)
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.amp.autocast(device_type=device.type, enabled=use_amp):
         full_prediction = model(batch["inp"], batch["input_mask"])
         prediction = gather_targets(
             full_prediction, batch["target_indices"]
@@ -395,7 +397,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     config = vars(args).copy()
     config["output_dir"] = str(config["output_dir"])
@@ -495,7 +497,11 @@ def main():
             )
             break
 
-    best = torch.load(args.output_dir / "best.pt", map_location=device)
+    best = torch.load(
+        args.output_dir / "best.pt",
+        map_location=device,
+        weights_only=True,
+    )
     model.load_state_dict(best["model"])
     test_metrics = run_epoch(
         model,
