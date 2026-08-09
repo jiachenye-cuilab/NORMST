@@ -1,0 +1,12 @@
+{
+  "train": {
+    "151507": "/data/yejiachen/Workdir/Data/151507",
+    "151508": "/data/yejiachen/Workdir/Data/151508"
+  },
+  "val": {
+    "151509": "/data/yejiachen/Workdir/Data/151509"
+  },
+  "test": {
+    "151673": "/data/yejiachen/Workdir/Data/151673"
+  }
+}

@@ -480,3 +480,97 @@ class PairedVisiumHDDataset(Dataset):
             "hr_gene_scale": torch.tensor(self.pair.hr_gene_scale[gene]),
             "gene_index": torch.tensor(gene, dtype=torch.long),
         }
+
+
+class JointPairedVisiumHDDataset(PairedVisiumHDDataset):
+    """Paired Visium HD patches containing every selected gene.
+
+    The historical paired dataset treats a gene as one sample.  The unified
+    geometry-adaptive model instead mixes genes inside a shared latent tensor,
+    so this adapter returns ``[G,H,W]`` LR input and ``[G,sH,sW]`` HR target
+    tensors while retaining the same spatial split and preprocessing scales.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = epoch
+
+    def __len__(self):
+        return len(self.origins) if self.deterministic else self.repeat
+
+    @staticmethod
+    def _extract_joint(
+        matrix: sp.csc_matrix,
+        library: np.ndarray,
+        row_map: np.ndarray,
+        row: int,
+        col: int,
+        height: int,
+        width: int,
+        target_sum: float,
+    ):
+        indices = row_map[row:row + height, col:col + width]
+        valid = indices >= 0
+        genes = matrix.shape[1]
+        values = np.zeros((height, width, genes), dtype=np.float32)
+        observations = indices[valid]
+        if len(observations):
+            counts = matrix[observations, :].toarray().astype(
+                np.float32, copy=False
+            )
+            normalized = counts * (
+                target_sum / np.maximum(library[observations], 1.0)
+            )[:, None]
+            values[valid] = np.log1p(normalized)
+        return values.transpose(2, 0, 1), valid.astype(np.float32)
+
+    def __getitem__(self, index):
+        if self.deterministic:
+            origin = self.origins[index % len(self.origins)]
+        else:
+            # Use a deterministic per-index generator.  DataLoader shuffling
+            # changes order, not the patch associated with an epoch sample.
+            rng = np.random.default_rng(
+                np.random.SeedSequence([self.seed, self.epoch, index])
+            )
+            origin = self.origins[int(rng.integers(len(self.origins)))]
+
+        scale = self.pair.scale
+        row_lr, col_lr = origin
+        inp, input_mask = self._extract_joint(
+            self.pair.lr_matrix,
+            self.pair.lr_library,
+            self.pair.lr_row_map,
+            row_lr,
+            col_lr,
+            self.patch_h,
+            self.patch_w,
+            self.pair.target_sum,
+        )
+        gt, target_mask = self._extract_joint(
+            self.pair.hr_matrix,
+            self.pair.hr_library,
+            self.pair.hr_row_map,
+            row_lr * scale,
+            col_lr * scale,
+            self.patch_h * scale,
+            self.patch_w * scale,
+            self.pair.target_sum,
+        )
+        inp = inp / self.pair.lr_gene_scale[:, None, None]
+        gt = gt / self.pair.hr_gene_scale[:, None, None]
+        return {
+            "inp": torch.from_numpy(inp),
+            "input_mask": torch.from_numpy(input_mask).unsqueeze(0),
+            "gt": torch.from_numpy(gt),
+            "target_mask": torch.from_numpy(target_mask).unsqueeze(0),
+            "baseline_scale": torch.from_numpy(
+                self.pair.lr_gene_scale / self.pair.hr_gene_scale
+            ),
+            "origin": torch.tensor(origin, dtype=torch.long),
+        }
