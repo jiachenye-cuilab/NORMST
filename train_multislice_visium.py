@@ -105,6 +105,21 @@ def parse_args(argv=None):
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--loss-mode", choices=("smooth_l1", "structure_aware"),
+        default="smooth_l1",
+        help=(
+            "training objective; checkpoint selection remains validation "
+            "SmoothL1 reconstruction, and the default preserves the old baseline"
+        ),
+    )
+    parser.add_argument("--gene-correlation-loss-weight", type=float, default=0.1)
+    parser.add_argument("--variance-loss-weight", type=float, default=0.01)
+    parser.add_argument("--negative-loss-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--min-structure-target-variance", type=float, default=1e-6,
+        help="exclude effectively flat target gene maps from structural losses",
+    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda")
@@ -227,6 +242,28 @@ def validate_args(args):
         raise ValueError("workers and patience must be non-negative")
     if args.min_delta < 0 or args.max_grad_norm < 0:
         raise ValueError("min_delta and max_grad_norm must be non-negative")
+    loss_values = (
+        args.gene_correlation_loss_weight,
+        args.variance_loss_weight,
+        args.negative_loss_weight,
+        args.min_structure_target_variance,
+    )
+    if min(loss_values) < 0:
+        raise ValueError("loss weights and variance threshold must be non-negative")
+    if args.loss_mode == "structure_aware" and not any(loss_values[:3]):
+        raise ValueError("structure_aware loss requires at least one positive weight")
+
+
+def build_loss_config(args):
+    if args.loss_mode == "smooth_l1":
+        return {"mode": "smooth_l1"}
+    return {
+        "mode": "structure_aware",
+        "gene_correlation_weight": args.gene_correlation_loss_weight,
+        "variance_weight": args.variance_loss_weight,
+        "negative_weight": args.negative_loss_weight,
+        "min_target_variance": args.min_structure_target_variance,
+    }
 
 
 def _loader(dataset, device, workers, shuffle=False, generator=None):
@@ -264,6 +301,7 @@ def evaluate_by_slice(
     full_xy,
     workers,
     description,
+    loss_config=None,
 ):
     per_slice = {}
     for local_index, name in enumerate(dataset.slice_names):
@@ -280,6 +318,7 @@ def evaluate_by_slice(
             description=f"{description}:{name}",
             full_neighbor=full_neighbors,
             full_xy=full_xy,
+            loss_config=loss_config,
         )
     return _macro_average(per_slice), per_slice
 
@@ -358,6 +397,7 @@ def main(argv=None):
         else requested_device
     )
     use_amp = device.type == "cuda" and not args.no_amp
+    loss_config = build_loss_config(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = resolve_run_manifest(args)
 
@@ -425,6 +465,7 @@ def main(argv=None):
     config.update({
         "model": "VisiumNORMST",
         "protocol": "slice_level_train_val_test",
+        "checkpoint_metric": "val_macro_reconstruction",
         "resolved_manifest": str(manifest_path.resolve()),
         "batch_size": 1,
         "n_selected_genes": len(prepared.genes),
@@ -471,6 +512,7 @@ def main(argv=None):
             full_neighbor=full_neighbors,
             full_xy=full_xy,
             detailed_metrics=False,
+            loss_config=loss_config,
         )
         train_seconds = perf_counter() - train_started
         val_started = perf_counter()
@@ -478,6 +520,7 @@ def main(argv=None):
             model, datasets["val"], device, use_amp,
             full_neighbors, full_xy, args.workers,
             description=f"val {epoch + 1}/{args.epochs}",
+            loss_config=loss_config,
         )
         val_seconds = perf_counter() - val_started
         record = {
@@ -503,8 +546,8 @@ def main(argv=None):
             "config": config,
         }
         torch.save(checkpoint, args.output_dir / "last.pt")
-        if val_macro["loss"] < best_val - args.min_delta:
-            best_val = val_macro["loss"]
+        if val_macro["reconstruction"] < best_val - args.min_delta:
+            best_val = val_macro["reconstruction"]
             stale_epochs = 0
             torch.save(checkpoint, args.output_dir / "best.pt")
         else:
@@ -512,7 +555,7 @@ def main(argv=None):
         if args.patience and stale_epochs >= args.patience:
             print(
                 f"Early stopping at epoch {epoch + 1}; "
-                f"best validation macro loss={best_val:.6f}"
+                f"best validation macro reconstruction={best_val:.6f}"
             )
             break
 
@@ -523,6 +566,7 @@ def main(argv=None):
     test_macro, test_per_slice = evaluate_by_slice(
         model, datasets["test"], device, use_amp,
         full_neighbors, full_xy, args.workers, description="test",
+        loss_config=loss_config,
     )
     test_metrics = {
         "best_epoch": best["epoch"],

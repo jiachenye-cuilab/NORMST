@@ -250,6 +250,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                     "--width", "8",
                     "--num-heads", "2",
                     "--operator-layers", "1",
+                    "--loss-mode", "structure_aware",
                     "--epochs", "1",
                     "--device", "cpu",
                     "--no-amp",
@@ -269,12 +270,16 @@ class MultiSlicePreparationTest(unittest.TestCase):
                 (output / "config.json").read_text(encoding="utf-8")
             )
             self.assertTrue(config["no_rms_scale"])
+            self.assertEqual(config["loss_mode"], "structure_aware")
             history = json.loads(
                 (output / "history.json").read_text(encoding="utf-8")
             )
             self.assertIn("train_loss", history[0])
             self.assertNotIn("train_gene_pearson", history[0])
             self.assertIn("val_macro_gene_pearson", history[0])
+            self.assertIn("val_macro_gene_correlation_loss", history[0])
+            self.assertIn("val_macro_variance_loss", history[0])
+            self.assertIn("val_macro_negative_loss", history[0])
             self.assertIn("macro", metrics)
             self.assertEqual(set(metrics["per_slice"]), {"test_a"})
             prediction_files = list((output / "test_predictions").glob("*.npz"))

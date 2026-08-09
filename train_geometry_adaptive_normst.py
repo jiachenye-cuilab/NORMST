@@ -171,6 +171,90 @@ def masked_smooth_l1(prediction, target, mask):
     return (elementwise * expanded).sum() / expanded.sum().clamp_min(1.0)
 
 
+def structure_aware_visium_loss(
+    prediction,
+    target,
+    mask,
+    gene_correlation_weight=0.1,
+    variance_weight=0.01,
+    negative_weight=0.1,
+    min_target_variance=1e-6,
+    epsilon=1e-8,
+):
+    """SmoothL1 plus spatial gene-structure and non-negativity penalties.
+
+    Correlation and variance are computed per gene across target spots. Genes
+    whose target map is effectively flat are excluded from both structural
+    terms. A constant prediction is retained with correlation zero, rather
+    than being dropped as an invalid correlation, so collapse is penalized.
+    """
+    if prediction.ndim != 3 or target.shape != prediction.shape:
+        raise ValueError(
+            "structure-aware loss expects matching [batch, spots, genes] tensors"
+        )
+    if mask.shape != (*prediction.shape[:2], 1):
+        raise ValueError("structure-aware loss expects mask shape [batch, spots, 1]")
+
+    base = masked_smooth_l1(prediction, target, mask)
+    prediction_float = prediction.float().transpose(1, 2)
+    target_float = target.float().transpose(1, 2)
+    weight = mask.to(prediction_float.dtype).transpose(1, 2).expand_as(
+        prediction_float
+    )
+    count = weight.sum(dim=-1).clamp_min(1.0)
+    prediction_mean = (prediction_float * weight).sum(dim=-1) / count
+    target_mean = (target_float * weight).sum(dim=-1) / count
+    prediction_centered = (
+        prediction_float - prediction_mean[..., None]
+    ) * weight
+    target_centered = (target_float - target_mean[..., None]) * weight
+    prediction_energy = prediction_centered.square().sum(dim=-1)
+    target_energy = target_centered.square().sum(dim=-1)
+    target_variance = target_energy / count
+    valid = (count >= 2) & (target_variance > min_target_variance)
+
+    zero = prediction_float.sum() * 0.0
+    if valid.any():
+        correlation = (
+            (prediction_centered * target_centered).sum(dim=-1)
+            / torch.sqrt(
+                (prediction_energy * target_energy).clamp_min(epsilon)
+            )
+        ).clamp(-1.0, 1.0)
+        gene_correlation_loss = 1.0 - correlation[valid].mean()
+        prediction_std = torch.sqrt(
+            (prediction_energy[valid] / count[valid]).clamp_min(epsilon)
+        )
+        target_std = torch.sqrt(target_variance[valid])
+        log_std_error = torch.log(prediction_std + epsilon) - torch.log(
+            target_std + epsilon
+        )
+        variance_loss = F.smooth_l1_loss(
+            log_std_error, torch.zeros_like(log_std_error)
+        )
+    else:
+        gene_correlation_loss = zero
+        variance_loss = zero
+
+    expanded = mask.to(prediction_float.dtype).expand_as(prediction)
+    negative_loss = (
+        F.relu(-prediction.float()).square() * expanded
+    ).sum() / expanded.sum().clamp_min(1.0)
+    total = (
+        base
+        + gene_correlation_weight * gene_correlation_loss
+        + variance_weight * variance_loss
+        + negative_weight * negative_loss
+    )
+    return total, {
+        "smooth_l1": base,
+        "gene_correlation": gene_correlation_loss,
+        "variance": variance_loss,
+        "negative": negative_loss,
+        "valid_genes": valid.sum(),
+    }
+
+
 def _masked_correlations(prediction, target, mask, epsilon=1e-8):
     """Vectorized Pearson for rows with a shared last-axis definition."""
     prediction = prediction.float()
@@ -326,10 +410,19 @@ def run_epoch(
     full_neighbor=None,
     full_xy=None,
     detailed_metrics=True,
+    loss_config=None,
 ):
     if report_baseline and not detailed_metrics:
         raise ValueError("baseline reporting requires detailed metrics")
     training = optimizer is not None
+    loss_config = {} if loss_config is None else dict(loss_config)
+    loss_mode = loss_config.pop("mode", "smooth_l1")
+    if loss_mode not in {"smooth_l1", "structure_aware"}:
+        raise ValueError(f"unsupported loss mode: {loss_mode}")
+    if loss_config and loss_mode == "smooth_l1":
+        raise ValueError("loss weights require loss mode 'structure_aware'")
+    if loss_mode == "structure_aware" and task != "visium":
+        raise ValueError("structure-aware loss is currently defined for Visium only")
     model.train(training)
     loss_only_sum = torch.zeros((), device=device, dtype=torch.float32)
     loss_only_count = torch.zeros((), device=device, dtype=torch.long)
@@ -349,6 +442,11 @@ def run_epoch(
         "baseline_spot_pearson_sum": 0.0,
         "baseline_spot_pearson_count": 0,
         "batches": 0,
+        "objective_sum": 0.0,
+        "gene_correlation_loss_sum": 0.0,
+        "variance_loss_sum": 0.0,
+        "negative_loss_sum": 0.0,
+        "structure_valid_gene_count": 0,
     }
     gradient_context = torch.enable_grad if training else torch.no_grad
     with gradient_context():
@@ -364,7 +462,13 @@ def run_epoch(
                     )
                 else:
                     prediction, target, mask, baseline = hd_prediction(model, batch)
-                loss = masked_smooth_l1(prediction, target, mask)
+                if loss_mode == "structure_aware":
+                    loss, loss_terms = structure_aware_visium_loss(
+                        prediction, target, mask, **loss_config
+                    )
+                else:
+                    loss = masked_smooth_l1(prediction, target, mask)
+                    loss_terms = None
             if not torch.isfinite(loss).item():
                 raise FloatingPointError(
                     f"{description}: non-finite loss; prediction_finite="
@@ -379,10 +483,14 @@ def run_epoch(
                 scaler.update()
 
             if not detailed_metrics:
-                expansion = prediction.numel() // mask.numel()
-                element_count = mask.count_nonzero() * expansion
-                loss_only_sum += loss.detach().float() * element_count
-                loss_only_count += element_count
+                if loss_mode == "structure_aware":
+                    loss_only_sum += loss.detach().float()
+                    loss_only_count += 1
+                else:
+                    expansion = prediction.numel() // mask.numel()
+                    element_count = mask.count_nonzero() * expansion
+                    loss_only_sum += loss.detach().float() * element_count
+                    loss_only_count += element_count
                 continue
 
             expanded_mask = mask.bool().expand_as(prediction)
@@ -449,6 +557,20 @@ def run_epoch(
                 )
                 totals["baseline_spot_pearson_count"] += baseline_spots.numel()
             totals["batches"] += 1
+            totals["objective_sum"] += float(loss.detach())
+            if loss_terms is not None:
+                totals["gene_correlation_loss_sum"] += float(
+                    loss_terms["gene_correlation"].detach()
+                )
+                totals["variance_loss_sum"] += float(
+                    loss_terms["variance"].detach()
+                )
+                totals["negative_loss_sum"] += float(
+                    loss_terms["negative"].detach()
+                )
+                totals["structure_valid_gene_count"] += int(
+                    loss_terms["valid_genes"].detach()
+                )
             progress.set_postfix(
                 loss=(
                     f"{totals['smooth_l1_sum'] / max(totals['element_count'], 1):.4f}"
@@ -475,8 +597,12 @@ def run_epoch(
         prediction_variance = float(
             gene_variance[valid_gene].mean() if valid_gene.any() else 0.0
         )
+    objective_loss = (
+        totals["objective_sum"] / max(totals["batches"], 1)
+        if loss_mode == "structure_aware" else pooled_loss
+    )
     metrics = {
-        "loss": pooled_loss,
+        "loss": objective_loss,
         "reconstruction": pooled_loss,
         "rmse": (totals["squared_error_sum"] / element_count) ** 0.5,
         "mae": totals["absolute_error_sum"] / element_count,
@@ -504,6 +630,18 @@ def run_epoch(
         / max(totals["spot_pearson_count"], 1),
         "spot_pearson_valid": totals["spot_pearson_count"],
     })
+    if loss_mode == "structure_aware":
+        batches = max(totals["batches"], 1)
+        metrics.update({
+            "gene_correlation_loss": (
+                totals["gene_correlation_loss_sum"] / batches
+            ),
+            "variance_loss": totals["variance_loss_sum"] / batches,
+            "negative_loss": totals["negative_loss_sum"] / batches,
+            "structure_valid_gene_count": totals[
+                "structure_valid_gene_count"
+            ],
+        })
     if report_baseline:
         baseline_reconstruction = totals["baseline_smooth_l1_sum"] / max(
             totals["baseline_element_count"], 1

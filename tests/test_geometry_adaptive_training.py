@@ -22,7 +22,11 @@ from models.geometry_adaptive_normst import (
     VisiumNORMST,
     build_native_hex_neighbors,
 )
-from train_geometry_adaptive_normst import main, run_epoch
+from train_geometry_adaptive_normst import (
+    main,
+    run_epoch,
+    structure_aware_visium_loss,
+)
 
 
 def artificial_hex():
@@ -82,6 +86,75 @@ class JointHDAdapterTest(unittest.TestCase):
 
 
 class TrainingStepTest(unittest.TestCase):
+    def test_structure_aware_loss_penalizes_collapse_and_negative_values(self):
+        target = torch.tensor([[[0.0, 2.0], [1.0, 2.0], [2.0, 2.0]]])
+        prediction = torch.tensor(
+            [[[-1.0, 2.0], [-1.0, 2.0], [-1.0, 2.0]]],
+            requires_grad=True,
+        )
+        mask = torch.ones(1, 3, 1, dtype=torch.bool)
+        loss, terms = structure_aware_visium_loss(
+            prediction, target, mask,
+            gene_correlation_weight=0.1,
+            variance_weight=0.01,
+            negative_weight=0.1,
+            min_target_variance=1e-6,
+        )
+        self.assertEqual(int(terms["valid_genes"]), 1)
+        self.assertAlmostEqual(float(terms["gene_correlation"].detach()), 1.0)
+        self.assertGreater(float(terms["variance"].detach()), 0.0)
+        self.assertGreater(float(terms["negative"].detach()), 0.0)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertTrue(torch.isfinite(prediction.grad).all())
+
+    def test_structure_aware_loss_only_matches_full_objective(self):
+        batches = [{
+            "prediction": torch.tensor([
+                [0.0, -0.2], [0.5, 0.3], [1.0, 0.7], [1.5, 1.1],
+            ]),
+            "target": torch.tensor([
+                [0.0, 0.1], [0.4, 0.4], [1.1, 0.8], [1.4, 1.2],
+            ]),
+            "mask": torch.ones(4, 1, dtype=torch.bool),
+        }]
+
+        def fake_prediction(_model, batch, _neighbor, _xy):
+            prediction = batch["prediction"]
+            return prediction, batch["target"], batch["mask"], torch.zeros_like(
+                prediction
+            )
+
+        loss_config = {
+            "mode": "structure_aware",
+            "gene_correlation_weight": 0.1,
+            "variance_weight": 0.01,
+            "negative_weight": 0.1,
+            "min_target_variance": 1e-6,
+        }
+        with patch(
+            "train_geometry_adaptive_normst.visium_prediction",
+            side_effect=fake_prediction,
+        ):
+            full = run_epoch(
+                "visium", torch.nn.Identity(),
+                DataLoader(batches, batch_size=1), torch.device("cpu"),
+                use_amp=False, loss_config=loss_config,
+            )
+        with patch(
+            "train_geometry_adaptive_normst.visium_prediction",
+            side_effect=fake_prediction,
+        ):
+            loss_only = run_epoch(
+                "visium", torch.nn.Identity(),
+                DataLoader(batches, batch_size=1), torch.device("cpu"),
+                use_amp=False, detailed_metrics=False,
+                loss_config=loss_config,
+            )
+        self.assertAlmostEqual(full["loss"], loss_only["loss"], places=6)
+        self.assertIn("gene_correlation_loss", full)
+        self.assertGreater(full["structure_valid_gene_count"], 0)
+
     def test_loss_only_metrics_preserve_parameter_update(self):
         batches = [{
             "features": torch.tensor([[1.0], [2.0], [3.0]]),
