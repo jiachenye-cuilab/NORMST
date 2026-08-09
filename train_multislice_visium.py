@@ -12,9 +12,10 @@ groups, for example::
       "test": {"151673": "/data/151673"}
     }
 
-HVGs and gene-wise RMS scales are fitted on all spots from training slices
-only. Every assigned slice contributes all of its generated masks to its own
-role and retains its own physical coordinates and native hex graph.
+HVGs are fitted on all spots from training slices only. Gene-wise RMS scales
+are also fitted there by default and can be disabled with ``--no-rms-scale``.
+Every assigned slice contributes all of its generated masks to its own role
+and retains its own physical coordinates and native hex graph.
 """
 
 from __future__ import annotations
@@ -68,6 +69,10 @@ def parse_args(argv=None):
     parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
     parser.add_argument("--n-genes", type=int, default=1000)
     parser.add_argument("--target-sum", type=float, default=1e4)
+    parser.add_argument(
+        "--no-rms-scale", action="store_true",
+        help="keep expression in log1p(CP10K) space without gene-wise RMS scaling",
+    )
     parser.add_argument(
         "--mask-target-fraction", "--train-target-fraction",
         dest="mask_target_fraction", type=float, default=0.25,
@@ -363,6 +368,7 @@ def main(argv=None):
         n_genes=args.n_genes,
         target_sum=args.target_sum,
         seed=args.seed,
+        apply_rms_scale=not args.no_rms_scale,
     )
     datasets = {
         role: MultiSlicePointDataset(

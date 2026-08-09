@@ -21,6 +21,7 @@ from train_multislice_visium import (
     build_random_manifest,
     discover_visium_slices,
     main,
+    parse_args,
     ratio_4_1_1_counts,
     resolve_run_manifest,
 )
@@ -98,7 +99,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
             ]
             self.assertEqual(len(assigned), len(set(assigned)))
 
-    def _prepare(self, directory: Path):
+    def _prepare(self, directory: Path, apply_rms_scale=True):
         manifest = {
             "train": {"train_a": "train_a", "train_b": "train_b"},
             "val": {"val_a": "val_a"},
@@ -123,7 +124,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
         ):
             prepared = prepare_multislice_visium(
                 str(manifest_path), n_genes=3, target_sum=1.0,
-                seed=7,
+                seed=7, apply_rms_scale=apply_rms_scale,
             )
         return manifest_path, prepared
 
@@ -141,6 +142,27 @@ class MultiSlicePreparationTest(unittest.TestCase):
             prepared.gene_scale, expected_scale, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_array_equal(prepared.genes, ["g0", "g1", "g2"])
+
+    def test_no_rms_scale_keeps_log1p_cp10k_expression(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, prepared = self._prepare(
+                Path(temporary), apply_rms_scale=False,
+            )
+        np.testing.assert_array_equal(
+            prepared.gene_scale, np.ones(3, dtype=np.float32),
+        )
+        for item, offset in zip(prepared.slices, (0.0, 3.0, 1000.0, 2000.0)):
+            counts = np.arange(1, 22, dtype=np.float32).reshape(7, 3) + offset
+            library = counts.sum(axis=1)
+            expected = np.log1p(counts / library[:, None])
+            np.testing.assert_allclose(
+                item.data.expression, expected, rtol=1e-6, atol=1e-6,
+            )
+
+    def test_no_rms_cli_flag_is_opt_in(self):
+        base = ["--manifest", "manifest.json", "--output-dir", "output"]
+        self.assertFalse(parse_args(base).no_rms_scale)
+        self.assertTrue(parse_args(base + ["--no-rms-scale"]).no_rms_scale)
 
     def test_hvg_selection_is_batch_aware_and_train_only(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -217,10 +239,11 @@ class MultiSlicePreparationTest(unittest.TestCase):
             with patch(
                 "train_multislice_visium.prepare_multislice_visium",
                 return_value=prepared,
-            ):
+            ) as prepare:
                 main([
                     "--manifest", str(manifest_path),
                     "--output-dir", str(output),
+                    "--no-rms-scale",
                     "--n-genes", "3",
                     "--masks-per-slice", "1",
                     "--query-neighbors", "2",
@@ -231,6 +254,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                     "--device", "cpu",
                     "--no-amp",
                 ])
+            self.assertFalse(prepare.call_args.kwargs["apply_rms_scale"])
             expected_files = {
                 "config.json", "manifest.json", "genes.txt",
                 "preprocessing.npz", "history.json", "best.pt", "last.pt",
@@ -241,6 +265,10 @@ class MultiSlicePreparationTest(unittest.TestCase):
             metrics = json.loads(
                 (output / "test_metrics.json").read_text(encoding="utf-8")
             )
+            config = json.loads(
+                (output / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(config["no_rms_scale"])
             self.assertIn("macro", metrics)
             self.assertEqual(set(metrics["per_slice"]), {"test_a"})
             prediction_files = list((output / "test_predictions").glob("*.npz"))

@@ -206,8 +206,13 @@ def prepare_multislice_visium(
     n_genes: int = 1000,
     target_sum: float = 1e4,
     seed: int = 2026,
+    apply_rms_scale: bool = True,
 ) -> MultiSliceVisiumData:
-    """Prepare slice-isolated data without fitting on val/test expression."""
+    """Prepare slice-isolated data without fitting on val/test expression.
+
+    When ``apply_rms_scale`` is false, expression remains in log1p(CP10K)
+    space and ``gene_scale`` is stored as ones for artifact compatibility.
+    """
     entries = _manifest_entries(manifest_path, count_file)
     raw_slices = _load_raw_slices(entries)
     common = _common_genes(raw_slices)
@@ -227,18 +232,22 @@ def prepare_multislice_visium(
             )[:, None]
         ).astype(np.float32, copy=False)
         unscaled.append(expression)
-        if item.role == "train":
+        if apply_rms_scale and item.role == "train":
             selected = expression.astype(np.float64)
             squared_sum += np.square(selected).sum(axis=0)
             training_count += len(selected)
-    if training_count < 1:
-        raise ValueError("no training spots are available for RMS fitting")
-    gene_scale = np.sqrt(squared_sum / training_count).astype(np.float32)
-    gene_scale = np.maximum(gene_scale, 1e-6)
+    if apply_rms_scale:
+        if training_count < 1:
+            raise ValueError("no training spots are available for RMS fitting")
+        gene_scale = np.sqrt(squared_sum / training_count).astype(np.float32)
+        gene_scale = np.maximum(gene_scale, 1e-6)
+    else:
+        gene_scale = np.ones(len(genes), dtype=np.float32)
 
     prepared = []
     for item, expression in zip(raw_slices, unscaled):
-        expression = expression / gene_scale[None, :]
+        if apply_rms_scale:
+            expression = expression / gene_scale[None, :]
         empty_context = np.empty((len(expression), 0), dtype=np.float32)
         empty = np.empty((0,), dtype=np.float32)
         empty_index = np.empty((0,), dtype=np.int64)
