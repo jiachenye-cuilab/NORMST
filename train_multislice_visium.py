@@ -470,6 +470,7 @@ def main(argv=None):
             description=f"train {epoch + 1}/{args.epochs}",
             full_neighbor=full_neighbors,
             full_xy=full_xy,
+            detailed_metrics=False,
         )
         train_seconds = perf_counter() - train_started
         val_started = perf_counter()

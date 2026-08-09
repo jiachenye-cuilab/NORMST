@@ -82,6 +82,51 @@ class JointHDAdapterTest(unittest.TestCase):
 
 
 class TrainingStepTest(unittest.TestCase):
+    def test_loss_only_metrics_preserve_parameter_update(self):
+        batches = [{
+            "features": torch.tensor([[1.0], [2.0], [3.0]]),
+            "target": torch.tensor([[0.5], [1.0], [1.5]]),
+            "mask": torch.ones(3, 1, dtype=torch.bool),
+        }]
+
+        def fake_prediction(model, batch, _neighbor, _xy):
+            prediction = model(batch["features"])
+            return prediction, batch["target"], batch["mask"], torch.zeros_like(
+                prediction
+            )
+
+        full_model = torch.nn.Linear(1, 1)
+        loss_only_model = torch.nn.Linear(1, 1)
+        loss_only_model.load_state_dict(full_model.state_dict())
+        full_optimizer = torch.optim.SGD(full_model.parameters(), lr=0.1)
+        loss_only_optimizer = torch.optim.SGD(
+            loss_only_model.parameters(), lr=0.1,
+        )
+        full_scaler = torch.amp.GradScaler("cpu", enabled=False)
+        loss_only_scaler = torch.amp.GradScaler("cpu", enabled=False)
+        with patch(
+            "train_geometry_adaptive_normst.visium_prediction",
+            side_effect=fake_prediction,
+        ):
+            full_metrics = run_epoch(
+                "visium", full_model, DataLoader(batches, batch_size=1),
+                torch.device("cpu"), optimizer=full_optimizer,
+                scaler=full_scaler, use_amp=False,
+            )
+            loss_only_metrics = run_epoch(
+                "visium", loss_only_model, DataLoader(batches, batch_size=1),
+                torch.device("cpu"), optimizer=loss_only_optimizer,
+                scaler=loss_only_scaler, use_amp=False,
+                detailed_metrics=False,
+            )
+        self.assertAlmostEqual(
+            full_metrics["loss"], loss_only_metrics["loss"], places=6,
+        )
+        for full, loss_only in zip(
+            full_model.parameters(), loss_only_model.parameters(),
+        ):
+            torch.testing.assert_close(full, loss_only, rtol=0.0, atol=0.0)
+
     def test_epoch_metrics_pool_elements_instead_of_averaging_batches(self):
         batches = [
             {
@@ -118,6 +163,18 @@ class TrainingStepTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["positive_mae"], 1.0)
         self.assertEqual(metrics["positive_count"], 1)
         self.assertEqual(metrics["element_count"], 4)
+
+        with patch(
+            "train_geometry_adaptive_normst.visium_prediction",
+            side_effect=fake_prediction,
+        ):
+            loss_only = run_epoch(
+                "visium", torch.nn.Identity(),
+                DataLoader(batches, batch_size=1), torch.device("cpu"),
+                use_amp=False, detailed_metrics=False,
+            )
+        self.assertEqual(set(loss_only), {"loss"})
+        self.assertAlmostEqual(loss_only["loss"], metrics["loss"])
 
     def test_visium_and_hd_one_optimizer_step(self):
         torch.manual_seed(11)

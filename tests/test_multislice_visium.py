@@ -269,6 +269,12 @@ class MultiSlicePreparationTest(unittest.TestCase):
                 (output / "config.json").read_text(encoding="utf-8")
             )
             self.assertTrue(config["no_rms_scale"])
+            history = json.loads(
+                (output / "history.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("train_loss", history[0])
+            self.assertNotIn("train_gene_pearson", history[0])
+            self.assertIn("val_macro_gene_pearson", history[0])
             self.assertIn("macro", metrics)
             self.assertEqual(set(metrics["per_slice"]), {"test_a"})
             prediction_files = list((output / "test_predictions").glob("*.npz"))

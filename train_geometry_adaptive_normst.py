@@ -325,9 +325,14 @@ def run_epoch(
     description="train",
     full_neighbor=None,
     full_xy=None,
+    detailed_metrics=True,
 ):
+    if report_baseline and not detailed_metrics:
+        raise ValueError("baseline reporting requires detailed metrics")
     training = optimizer is not None
     model.train(training)
+    loss_only_sum = torch.zeros((), device=device, dtype=torch.float32)
+    loss_only_count = torch.zeros((), device=device, dtype=torch.long)
     totals = {
         "smooth_l1_sum": 0.0, "squared_error_sum": 0.0,
         "absolute_error_sum": 0.0, "element_count": 0,
@@ -372,6 +377,13 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
+
+            if not detailed_metrics:
+                expansion = prediction.numel() // mask.numel()
+                element_count = mask.count_nonzero() * expansion
+                loss_only_sum += loss.detach().float() * element_count
+                loss_only_count += element_count
+                continue
 
             expanded_mask = mask.bool().expand_as(prediction)
             error = (prediction.detach().float() - target.float())[expanded_mask]
@@ -442,6 +454,10 @@ def run_epoch(
                     f"{totals['smooth_l1_sum'] / max(totals['element_count'], 1):.4f}"
                 )
             )
+
+    if not detailed_metrics:
+        pooled_loss = loss_only_sum / loss_only_count.clamp_min(1)
+        return {"loss": float(pooled_loss)}
 
     element_count = max(totals["element_count"], 1)
     positive_count = max(totals["positive_count"], 1)
