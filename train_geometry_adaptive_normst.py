@@ -217,6 +217,25 @@ def _gene_variance_mean(prediction, mask, task):
     return variance[valid].mean() if valid.any() else values.sum() * 0.0
 
 
+def _gene_value_moments(prediction, mask, task):
+    """Return pooled per-gene sum, square sum, and valid count."""
+    values = prediction.detach().float()
+    if task == "visium":
+        weight = mask.expand_as(values).to(values.dtype)
+        dimensions = (0, 1)
+    else:
+        weight = mask.expand_as(values).to(values.dtype)
+        dimensions = (0, 2, 3)
+    weighted = values * weight
+    return (
+        weighted.sum(dim=dimensions, dtype=torch.float64).cpu(),
+        (values.square() * weight).sum(
+            dim=dimensions, dtype=torch.float64
+        ).cpu(),
+        weight.sum(dim=dimensions, dtype=torch.float64).cpu(),
+    )
+
+
 def correlation_values(prediction, target, mask, task):
     """Return valid gene-wise and spot-wise Pearson values."""
     if task == "visium":
@@ -310,13 +329,16 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     totals = {
-        "loss": 0.0, "reconstruction": 0.0, "rmse": 0.0,
-        "mae": 0.0, "positive_rmse": 0.0, "positive_mae": 0.0,
-        "negative_fraction": 0.0, "near_zero_fraction": 0.0,
-        "prediction_variance": 0.0,
+        "smooth_l1_sum": 0.0, "squared_error_sum": 0.0,
+        "absolute_error_sum": 0.0, "element_count": 0,
+        "positive_squared_error_sum": 0.0,
+        "positive_absolute_error_sum": 0.0, "positive_count": 0,
+        "negative_prediction_count": 0, "near_zero_prediction_count": 0,
+        "gene_value_sum": None, "gene_value_square_sum": None,
+        "gene_value_count": None,
         "gene_pearson_sum": 0.0, "gene_pearson_count": 0,
         "spot_pearson_sum": 0.0, "spot_pearson_count": 0,
-        "baseline_reconstruction": 0.0,
+        "baseline_smooth_l1_sum": 0.0, "baseline_element_count": 0,
         "baseline_gene_pearson_sum": 0.0,
         "baseline_gene_pearson_count": 0,
         "baseline_spot_pearson_sum": 0.0,
@@ -359,35 +381,53 @@ def run_epoch(
             genes, spots = correlation_values(
                 prediction.detach(), target, mask, task
             )
-            totals["loss"] += float(loss.detach())
-            totals["reconstruction"] += float(loss.detach())
-            totals["rmse"] += float(error.square().mean().sqrt())
-            totals["mae"] += float(error.abs().mean())
+            element_count = error.numel()
+            totals["smooth_l1_sum"] += float(F.smooth_l1_loss(
+                selected_prediction, selected_target, reduction="sum"
+            ))
+            totals["squared_error_sum"] += float(error.square().sum())
+            totals["absolute_error_sum"] += float(error.abs().sum())
+            totals["element_count"] += element_count
             if positive.any():
-                totals["positive_rmse"] += float(
-                    error[positive].square().mean().sqrt()
+                positive_error = error[positive]
+                totals["positive_squared_error_sum"] += float(
+                    positive_error.square().sum()
                 )
-                totals["positive_mae"] += float(error[positive].abs().mean())
-            totals["negative_fraction"] += float(
-                (selected_prediction < 0).float().mean()
+                totals["positive_absolute_error_sum"] += float(
+                    positive_error.abs().sum()
+                )
+                totals["positive_count"] += positive_error.numel()
+            totals["negative_prediction_count"] += int(
+                (selected_prediction < 0).sum()
             )
-            totals["near_zero_fraction"] += float(
-                (selected_prediction.abs() < 1e-8).float().mean()
+            totals["near_zero_prediction_count"] += int(
+                (selected_prediction.abs() < 1e-8).sum()
             )
-            totals["prediction_variance"] += float(
-                _gene_variance_mean(prediction.detach(), mask, task)
+            gene_sum, gene_square_sum, gene_count = _gene_value_moments(
+                prediction, mask, task
             )
+            if totals["gene_value_sum"] is None:
+                totals["gene_value_sum"] = gene_sum
+                totals["gene_value_square_sum"] = gene_square_sum
+                totals["gene_value_count"] = gene_count
+            else:
+                totals["gene_value_sum"] += gene_sum
+                totals["gene_value_square_sum"] += gene_square_sum
+                totals["gene_value_count"] += gene_count
             totals["gene_pearson_sum"] += float(genes.sum())
             totals["gene_pearson_count"] += genes.numel()
             totals["spot_pearson_sum"] += float(spots.sum())
             totals["spot_pearson_count"] += spots.numel()
 
             if report_baseline:
-                baseline_loss = masked_smooth_l1(baseline, target, mask)
+                selected_baseline = baseline.float()[expanded_mask]
                 baseline_genes, baseline_spots = correlation_values(
                     baseline, target, mask, task
                 )
-                totals["baseline_reconstruction"] += float(baseline_loss)
+                totals["baseline_smooth_l1_sum"] += float(F.smooth_l1_loss(
+                    selected_baseline, selected_target, reduction="sum"
+                ))
+                totals["baseline_element_count"] += element_count
                 totals["baseline_gene_pearson_sum"] += float(
                     baseline_genes.sum()
                 )
@@ -398,17 +438,47 @@ def run_epoch(
                 totals["baseline_spot_pearson_count"] += baseline_spots.numel()
             totals["batches"] += 1
             progress.set_postfix(
-                loss=f"{totals['loss'] / totals['batches']:.4f}"
+                loss=(
+                    f"{totals['smooth_l1_sum'] / max(totals['element_count'], 1):.4f}"
+                )
             )
 
-    batches = max(totals["batches"], 1)
-    metrics = {
-        name: totals[name] / batches
-        for name in (
-            "loss", "reconstruction", "rmse", "mae", "positive_rmse",
-            "positive_mae", "negative_fraction", "near_zero_fraction",
-            "prediction_variance",
+    element_count = max(totals["element_count"], 1)
+    positive_count = max(totals["positive_count"], 1)
+    pooled_loss = totals["smooth_l1_sum"] / element_count
+    gene_count = totals["gene_value_count"]
+    if gene_count is None:
+        prediction_variance = 0.0
+    else:
+        valid_gene = gene_count >= 2
+        gene_mean = totals["gene_value_sum"] / gene_count.clamp_min(1.0)
+        gene_variance = (
+            totals["gene_value_square_sum"] / gene_count.clamp_min(1.0)
+            - gene_mean.square()
+        ).clamp_min(0.0)
+        prediction_variance = float(
+            gene_variance[valid_gene].mean() if valid_gene.any() else 0.0
         )
+    metrics = {
+        "loss": pooled_loss,
+        "reconstruction": pooled_loss,
+        "rmse": (totals["squared_error_sum"] / element_count) ** 0.5,
+        "mae": totals["absolute_error_sum"] / element_count,
+        "positive_rmse": (
+            totals["positive_squared_error_sum"] / positive_count
+        ) ** 0.5,
+        "positive_mae": (
+            totals["positive_absolute_error_sum"] / positive_count
+        ),
+        "positive_count": totals["positive_count"],
+        "negative_fraction": (
+            totals["negative_prediction_count"] / element_count
+        ),
+        "near_zero_fraction": (
+            totals["near_zero_prediction_count"] / element_count
+        ),
+        "prediction_variance": prediction_variance,
+        "element_count": totals["element_count"],
     }
     metrics.update({
         "gene_pearson": totals["gene_pearson_sum"]
@@ -419,7 +489,9 @@ def run_epoch(
         "spot_pearson_valid": totals["spot_pearson_count"],
     })
     if report_baseline:
-        baseline_reconstruction = totals["baseline_reconstruction"] / batches
+        baseline_reconstruction = totals["baseline_smooth_l1_sum"] / max(
+            totals["baseline_element_count"], 1
+        )
         baseline_gene = totals["baseline_gene_pearson_sum"] / max(
             totals["baseline_gene_pearson_count"], 1
         )
@@ -580,6 +652,7 @@ def prepare_hd(args, _device):
 def collect_predictions(task, model, loader, device, use_amp, full_neighbor, full_xy):
     model.eval()
     collected = {"prediction": [], "truth": [], "baseline": [], "mask": []}
+    target_spots = []
     origins = []
     for cpu_batch in loader:
         batch = move_batch(cpu_batch, device)
@@ -597,9 +670,13 @@ def collect_predictions(task, model, loader, device, use_amp, full_neighbor, ful
             collected[key].append(value.float().cpu().numpy())
         if "origin" in batch:
             origins.append(batch["origin"].cpu().numpy())
+        if "target_spots" in batch:
+            target_spots.append(batch["target_spots"].cpu().numpy())
     result = {key: np.concatenate(value, axis=0) for key, value in collected.items()}
     if origins:
         result["origins"] = np.concatenate(origins, axis=0)
+    if target_spots:
+        result["target_spots"] = np.concatenate(target_spots, axis=0)
     return result
 
 
@@ -667,6 +744,7 @@ def main(argv=None):
     for epoch in range(args.epochs):
         if hasattr(datasets["train"], "set_epoch"):
             datasets["train"].set_epoch(epoch)
+        learning_rate_used = optimizer.param_groups[0]["lr"]
         train_started = perf_counter()
         train_metrics = run_epoch(
             args.task, model, loaders["train"], device,
@@ -684,10 +762,9 @@ def main(argv=None):
             full_neighbor=full_neighbor, full_xy=full_xy,
         )
         val_seconds = perf_counter() - val_started
-        scheduler.step()
         record = {
             "epoch": epoch + 1,
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rate": learning_rate_used,
             "train_seconds": train_seconds,
             "val_seconds": val_seconds,
             **{f"train_{key}": value for key, value in train_metrics.items()},
@@ -698,6 +775,7 @@ def main(argv=None):
             json.dumps(history, indent=2), encoding="utf-8"
         )
         print(json.dumps(record))
+        scheduler.step()
         checkpoint = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),

@@ -48,23 +48,28 @@ python /data/yejiachen/Workdir/NORMST/train_geometry_adaptive_normst.py \
 
 ### Multi-slice standard Visium
 
-Edit `configs/multislice_visium.example.json` so every train, validation and
-test entry points to a different slice directory. HVGs and RMS scales are fit
-only on visible spots from training slices.
+Place each standard Visium slice in a direct child directory such as
+`/data/yejiachen/Workdir/Data/visium/151673`. The training entry discovers
+valid slices, randomly splits them 4:1:1 at slice level using `--seed`, and
+saves the exact split to `output_dir/manifest.json`. A prebuilt split can still
+be supplied with `--manifest` instead of `--visium-root`.
 
 ```bash
 python /data/yejiachen/Workdir/NORMST/train_multislice_visium.py \
-  --manifest /data/yejiachen/Workdir/NORMST/configs/multislice_visium.example.json \
+  --visium-root /data/yejiachen/Workdir/Data/visium \
   --output-dir /data/yejiachen/Workdir/NORMST/save/multislice/seed2027 \
   --n-genes 1000 \
   --masks-per-slice 64 \
+  --mask-target-fraction 0.25 \
   --seed 2027 \
   --device cuda
 ```
 
-The multi-slice route currently uses batch size one because each random mask
-has a different compact native graph. It reports per-slice metrics together
-with an equal-slice macro average.
+Every mask from a training slice is used for training; validation and test
+slices never contribute masks to training. HVGs and RMS scales are fitted only
+on training slices. The route uses batch size one because each random mask has
+a different compact native graph, and reports pooled element-level metrics,
+per-slice metrics, and an equal-slice macro average.
 
 ### Synthetic validation
 

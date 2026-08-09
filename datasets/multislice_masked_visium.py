@@ -11,9 +11,9 @@ from typing import Any
 import numpy as np
 import scanpy as sc
 import torch
+from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 
-from datasets.joint_masked_visium import PointJointMaskedVisiumDataset
 from datasets.masked_visium import (
     MaskedVisiumData,
     _as_csr,
@@ -61,7 +61,6 @@ class _RawSlice:
     array_row: np.ndarray
     array_col: np.ndarray
     observed_spots: np.ndarray
-    held_out_spots: np.ndarray
 
 
 def _manifest_entries(manifest_path: str, default_count_file: str):
@@ -119,28 +118,9 @@ def _manifest_entries(manifest_path: str, default_count_file: str):
     return entries
 
 
-def _visibility_split(
-    rows: np.ndarray,
-    cols: np.ndarray,
-    observed_fraction: float,
-    seed: int,
-):
-    if not 0.0 < observed_fraction < 1.0:
-        raise ValueError("observed_fraction must be between zero and one")
-    if np.isclose(observed_fraction, 0.5):
-        observed_mask = (rows + cols) % 2 == 0
-    else:
-        observed_mask = np.random.default_rng(seed).random(len(rows)) < observed_fraction
-    observed = np.flatnonzero(observed_mask)
-    held_out = np.flatnonzero(~observed_mask)
-    if min(len(observed), len(held_out)) == 0:
-        raise ValueError("a multi-slice visibility split produced an empty partition")
-    return np.sort(observed), np.sort(held_out)
-
-
-def _load_raw_slices(entries, observed_fraction: float, seed: int):
+def _load_raw_slices(entries):
     raw_slices = []
-    for index, entry in enumerate(entries):
+    for entry in entries:
         adata = _read_standard_visium(entry["path"], entry["count_file"])
         keep = ~adata.var_names.str.startswith("DEPRECATED_")
         adata = adata[:, keep].copy()
@@ -149,9 +129,7 @@ def _load_raw_slices(entries, observed_fraction: float, seed: int):
         )
         raw_matrix = _as_csr(adata.X)
         library_size = np.asarray(raw_matrix.sum(axis=1)).ravel().astype(np.float32)
-        observed, held_out = _visibility_split(
-            rows, cols, observed_fraction, seed + index * 100003
-        )
+        all_spots = np.arange(len(rows), dtype=np.int64)
         array_row = adata.obs["array_row"].to_numpy(np.int64).copy()
         array_col = adata.obs["array_col"].to_numpy(np.int64).copy()
         raw_slices.append(_RawSlice(
@@ -169,8 +147,7 @@ def _load_raw_slices(entries, observed_fraction: float, seed: int):
             row_parity=row_parity,
             array_row=array_row,
             array_col=array_col,
-            observed_spots=observed,
-            held_out_spots=held_out,
+            observed_spots=all_spots,
         ))
     return raw_slices
 
@@ -201,13 +178,21 @@ def _select_training_hvgs(
         )
     if n_genes == len(common_genes):
         return common_genes.copy()
-    sources = [
-        item.adata[item.observed_spots, common_genes].copy()
-        for item in raw_slices if item.role == "train"
-    ]
-    pooled = sc.concat(sources, join="inner", index_unique="-")
+    training = [item for item in raw_slices if item.role == "train"]
+    sources = [item.adata[:, common_genes].copy() for item in training]
+    pooled = sc.concat(
+        sources,
+        join="inner",
+        label="slice_id",
+        keys=[item.name for item in training],
+        index_unique="-",
+    )
     sc.pp.highly_variable_genes(
-        pooled, flavor="seurat_v3", n_top_genes=n_genes, inplace=True
+        pooled,
+        flavor="seurat_v3_paper",
+        n_top_genes=n_genes,
+        batch_key="slice_id",
+        inplace=True,
     )
     genes = pooled.var_names[pooled.var["highly_variable"]].to_numpy()
     if len(genes) != min(n_genes, len(common_genes)):
@@ -220,12 +205,11 @@ def prepare_multislice_visium(
     count_file: str = "filtered_feature_bc_matrix.h5",
     n_genes: int = 1000,
     target_sum: float = 1e4,
-    observed_fraction: float = 0.5,
     seed: int = 2026,
 ) -> MultiSliceVisiumData:
-    """Prepare shared genes/scales without fitting on val or test expression."""
+    """Prepare slice-isolated data without fitting on val/test expression."""
     entries = _manifest_entries(manifest_path, count_file)
-    raw_slices = _load_raw_slices(entries, observed_fraction, seed)
+    raw_slices = _load_raw_slices(entries)
     common = _common_genes(raw_slices)
     genes = _select_training_hvgs(raw_slices, common, n_genes)
 
@@ -244,11 +228,11 @@ def prepare_multislice_visium(
         ).astype(np.float32, copy=False)
         unscaled.append(expression)
         if item.role == "train":
-            selected = expression[item.observed_spots].astype(np.float64)
+            selected = expression.astype(np.float64)
             squared_sum += np.square(selected).sum(axis=0)
             training_count += len(selected)
     if training_count < 1:
-        raise ValueError("no observed training spots are available for RMS fitting")
+        raise ValueError("no training spots are available for RMS fitting")
     gene_scale = np.sqrt(squared_sum / training_count).astype(np.float32)
     gene_scale = np.maximum(gene_scale, 1e-6)
 
@@ -277,12 +261,8 @@ def prepare_multislice_visium(
             physical_query_relative=empty,
             physical_query_mask=empty,
             observed_spots=item.observed_spots,
-            validation_spots=(
-                item.held_out_spots if item.role == "val" else empty_index
-            ),
-            test_spots=(
-                item.held_out_spots if item.role == "test" else empty_index
-            ),
+            validation_spots=empty_index,
+            test_spots=empty_index,
         )
         prepared.append(PreparedVisiumSlice(
             name=item.name,
@@ -315,6 +295,113 @@ class _TaggedSliceDataset(Dataset):
         return item
 
 
+class _WholeSliceMaskDataset(Dataset):
+    """Generate deterministic masks from every spot in one assigned slice.
+
+    The slice role is fixed by the manifest. Training masks change by epoch;
+    validation and test masks stay fixed. No spot from another role is used.
+    """
+
+    _ROLE_SEED = {"train": 0, "val": 1, "test": 2}
+
+    def __init__(
+        self,
+        data: MaskedVisiumData,
+        role: str,
+        masks_per_slice: int,
+        target_fraction: float,
+        idw_neighbors: int,
+        seed: int,
+    ):
+        if role not in self._ROLE_SEED:
+            raise ValueError("role must be train, val, or test")
+        if masks_per_slice < 1:
+            raise ValueError("masks_per_slice must be positive")
+        if not 0.0 < target_fraction < 1.0:
+            raise ValueError("target_fraction must be between zero and one")
+        if idw_neighbors < 1:
+            raise ValueError("idw_neighbors must be positive")
+        if len(data.expression) < 2:
+            raise ValueError("a slice needs at least two tissue spots")
+        self.data = data
+        self.role = role
+        self.masks_per_slice = masks_per_slice
+        self.target_fraction = target_fraction
+        self.idw_neighbors = idw_neighbors
+        self.seed = seed
+        self.epoch = 0
+        self.all_spots = np.arange(len(data.expression), dtype=np.int64)
+
+    def __len__(self):
+        return self.masks_per_slice
+
+    def set_epoch(self, epoch: int):
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        if self.role == "train":
+            self.epoch = epoch
+
+    def _partition(self, index: int):
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        target_count = min(
+            len(self.all_spots) - 1,
+            max(1, round(len(self.all_spots) * self.target_fraction)),
+        )
+        mask_epoch = self.epoch if self.role == "train" else 0
+        rng = np.random.default_rng(np.random.SeedSequence([
+            self.seed, self._ROLE_SEED[self.role], mask_epoch, index,
+        ]))
+        target_spots = np.sort(
+            rng.choice(self.all_spots, size=target_count, replace=False)
+            .astype(np.int64, copy=False)
+        )
+        hidden = np.zeros(len(self.all_spots), dtype=bool)
+        hidden[target_spots] = True
+        return self.all_spots[~hidden], target_spots
+
+    def _baseline(self, visible_spots, target_spots):
+        if self.role == "train":
+            return np.zeros(
+                (len(target_spots), len(self.data.genes)), dtype=np.float32
+            )
+        neighbors = min(self.idw_neighbors, len(visible_spots))
+        distances, indices = cKDTree(
+            self.data.physical_xy[visible_spots]
+        ).query(self.data.physical_xy[target_spots], k=neighbors)
+        if neighbors == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        weights = 1.0 / np.maximum(distances, 1e-6) ** 2
+        weights /= weights.sum(axis=1, keepdims=True)
+        neighbor_expression = self.data.expression[visible_spots[indices]]
+        return np.einsum(
+            "qk,qkg->qg", weights, neighbor_expression, optimize=True
+        ).astype(np.float32)
+
+    def __getitem__(self, index):
+        visible_spots, target_spots = self._partition(index)
+        return {
+            "visible_expression": torch.from_numpy(
+                self.data.expression[visible_spots].astype(np.float32, copy=False)
+            ),
+            "visible_coord": torch.from_numpy(
+                self.data.physical_xy[visible_spots].astype(np.float32, copy=False)
+            ),
+            "query_coord": torch.from_numpy(
+                self.data.physical_xy[target_spots].astype(np.float32, copy=False)
+            ),
+            "target_values": torch.from_numpy(
+                self.data.expression[target_spots].astype(np.float32, copy=False)
+            ),
+            "target_spots": torch.from_numpy(target_spots),
+            "visible_spots": torch.from_numpy(visible_spots),
+            "baseline": torch.from_numpy(
+                self._baseline(visible_spots, target_spots)
+            ),
+        }
+
+
 class MultiSlicePointDataset(Dataset):
     """Balanced concatenation of per-slice compact point datasets."""
 
@@ -323,7 +410,7 @@ class MultiSlicePointDataset(Dataset):
         prepared: MultiSliceVisiumData,
         role: str,
         masks_per_slice: int = 64,
-        train_target_fraction: float = 0.25,
+        mask_target_fraction: float = 0.25,
         idw_neighbors: int = 6,
         seed: int = 2026,
     ):
@@ -340,11 +427,11 @@ class MultiSlicePointDataset(Dataset):
         self.children = []
         self.global_slice_indices = []
         for global_index, item in selected:
-            child = PointJointMaskedVisiumDataset(
+            child = _WholeSliceMaskDataset(
                 item.data,
-                split=role,
-                masks_per_epoch=masks_per_slice,
-                train_target_fraction=train_target_fraction,
+                role=role,
+                masks_per_slice=masks_per_slice,
+                target_fraction=mask_target_fraction,
                 idw_neighbors=idw_neighbors,
                 seed=seed + global_index * 100003,
             )

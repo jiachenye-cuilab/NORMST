@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 import tempfile
@@ -81,6 +82,43 @@ class JointHDAdapterTest(unittest.TestCase):
 
 
 class TrainingStepTest(unittest.TestCase):
+    def test_epoch_metrics_pool_elements_instead_of_averaging_batches(self):
+        batches = [
+            {
+                "prediction": torch.tensor([[0.0]]),
+                "target": torch.tensor([[1.0]]),
+                "mask": torch.ones(1, 1, dtype=torch.bool),
+            },
+            {
+                "prediction": torch.tensor([[3.0], [3.0], [3.0]]),
+                "target": torch.tensor([[0.0], [0.0], [0.0]]),
+                "mask": torch.ones(3, 1, dtype=torch.bool),
+            },
+        ]
+
+        def fake_prediction(_model, batch, _neighbor, _xy):
+            prediction = batch["prediction"]
+            return prediction, batch["target"], batch["mask"], torch.zeros_like(
+                prediction
+            )
+
+        with patch(
+            "train_geometry_adaptive_normst.visium_prediction",
+            side_effect=fake_prediction,
+        ):
+            metrics = run_epoch(
+                "visium", torch.nn.Identity(),
+                DataLoader(batches, batch_size=1), torch.device("cpu"),
+                use_amp=False,
+            )
+        self.assertAlmostEqual(metrics["loss"], 2.0)
+        self.assertAlmostEqual(metrics["rmse"], np.sqrt(7.0))
+        self.assertAlmostEqual(metrics["mae"], 2.5)
+        self.assertAlmostEqual(metrics["positive_rmse"], 1.0)
+        self.assertAlmostEqual(metrics["positive_mae"], 1.0)
+        self.assertEqual(metrics["positive_count"], 1)
+        self.assertEqual(metrics["element_count"], 4)
+
     def test_visium_and_hd_one_optimizer_step(self):
         torch.manual_seed(11)
         device = torch.device("cpu")
@@ -187,6 +225,10 @@ class TrainingStepTest(unittest.TestCase):
             self.assertEqual(
                 expected, {path.name for path in output.iterdir()}
             )
+            history = json.loads(
+                (output / "history.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(history[0]["learning_rate"], 2e-5)
 
 
 if __name__ == "__main__":

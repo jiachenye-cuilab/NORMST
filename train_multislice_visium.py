@@ -1,7 +1,10 @@
 """Train VisiumNORMST across slice-level train/val/test partitions.
 
-The JSON manifest must contain non-empty ``train``, ``val`` and ``test``
-groups.  Each group can map slice names to data directories, for example::
+Pass ``--visium-root`` to discover its direct child slice directories and
+randomly split them 4:1:1. The resolved split is always saved as
+``output_dir/manifest.json``. A prebuilt manifest can alternatively be passed
+with ``--manifest``; it must contain non-empty ``train``, ``val`` and ``test``
+groups, for example::
 
     {
       "train": {"151507": "/data/151507", "151508": "/data/151508"},
@@ -9,8 +12,9 @@ groups.  Each group can map slice names to data directories, for example::
       "test": {"151673": "/data/151673"}
     }
 
-HVGs and gene-wise RMS scales are fitted only on visible spots from training
-slices.  Every slice retains its own physical coordinates and native hex graph.
+HVGs and gene-wise RMS scales are fitted on all spots from training slices
+only. Every assigned slice contributes all of its generated masks to its own
+role and retains its own physical coordinates and native hex graph.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import random
 import re
 from time import perf_counter
 
@@ -40,15 +45,37 @@ from train_geometry_adaptive_normst import (
 )
 
 
+POSITION_FILES = (
+    "tissue_positions.csv",
+    "tissue_positions_list.csv",
+    "tissue_positions_list.txt",
+    "tissue_positions.parquet",
+)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--visium-root", type=Path,
+        help="directory whose direct children are standard Visium slices",
+    )
+    source.add_argument(
+        "--manifest", type=Path,
+        help="optional prebuilt slice-level split manifest",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
     parser.add_argument("--n-genes", type=int, default=1000)
     parser.add_argument("--target-sum", type=float, default=1e4)
-    parser.add_argument("--observed-fraction", type=float, default=0.5)
-    parser.add_argument("--train-target-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--mask-target-fraction", "--train-target-fraction",
+        dest="mask_target_fraction", type=float, default=0.25,
+        help=(
+            "fraction of spots hidden inside every train/val/test mask; "
+            "--train-target-fraction remains as a compatibility alias"
+        ),
+    )
     parser.add_argument("--masks-per-slice", type=int, default=64)
     parser.add_argument("--query-neighbors", type=int, default=6)
     parser.add_argument("--idw-power", type=float, default=2.0)
@@ -80,6 +107,105 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def discover_visium_slices(data_root: Path, count_file: str):
+    root = data_root.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Visium data root does not exist: {root}")
+    valid = []
+    skipped = []
+    for candidate in sorted(root.iterdir(), key=lambda item: item.name):
+        if not candidate.is_dir():
+            continue
+        count_path = candidate / count_file
+        spatial_dir = candidate / "spatial"
+        position_path = next(
+            (spatial_dir / name for name in POSITION_FILES
+             if (spatial_dir / name).is_file()),
+            None,
+        )
+        if count_path.is_file() and position_path is not None:
+            valid.append(candidate.resolve())
+        else:
+            missing = []
+            if not count_path.is_file():
+                missing.append(count_file)
+            if position_path is None:
+                missing.append("spatial/tissue_positions*")
+            skipped.append({"directory": str(candidate.resolve()), "missing": missing})
+    return valid, skipped
+
+
+def ratio_4_1_1_counts(n_slices: int):
+    if n_slices < 6:
+        raise ValueError(
+            "a non-empty 4:1:1 train/val/test split requires at least 6 slices; "
+            f"found {n_slices}"
+        )
+    train_count = round(n_slices * 4 / 6)
+    val_count = round(n_slices / 6)
+    test_count = n_slices - train_count - val_count
+    if min(train_count, val_count, test_count) < 1:
+        raise ValueError("4:1:1 rounding produced an empty split")
+    return train_count, val_count, test_count
+
+
+def build_random_manifest(slice_paths, seed, data_root, count_file):
+    paths = list(slice_paths)
+    train_count, val_count, test_count = ratio_4_1_1_counts(len(paths))
+    random.Random(seed).shuffle(paths)
+    groups = {
+        "train": paths[:train_count],
+        "val": paths[train_count:train_count + val_count],
+        "test": paths[train_count + val_count:],
+    }
+    manifest = {
+        "_meta": {
+            "source": "auto_discovered_visium_root",
+            "seed": seed,
+            "ratio": [4, 1, 1],
+            "counts": {
+                "train": train_count, "val": val_count, "test": test_count,
+            },
+            "data_root": str(data_root.resolve()),
+            "count_file": count_file,
+        }
+    }
+    for role, role_paths in groups.items():
+        manifest[role] = {path.name: str(path) for path in role_paths}
+    return manifest
+
+
+def resolve_run_manifest(args):
+    output_manifest = args.output_dir / "manifest.json"
+    if args.manifest is not None:
+        payload = json.loads(args.manifest.read_text(encoding="utf-8"))
+    else:
+        slices, skipped = discover_visium_slices(
+            args.visium_root, args.count_file
+        )
+        payload = build_random_manifest(
+            slices, args.seed, args.visium_root, args.count_file
+        )
+        counts = payload["_meta"]["counts"]
+        print(
+            f"Discovered {len(slices)} slices: "
+            f"train={counts['train']}, val={counts['val']}, "
+            f"test={counts['test']}"
+        )
+        if skipped:
+            print(f"Skipped {len(skipped)} incomplete directories:")
+            for item in skipped:
+                print(
+                    f"  {item['directory']}: missing "
+                    f"{', '.join(item['missing'])}"
+                )
+    output_manifest.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return output_manifest
+
+
 def validate_args(args):
     positive = (
         args.n_genes, args.target_sum, args.masks_per_slice,
@@ -90,10 +216,8 @@ def validate_args(args):
         raise ValueError("model, preprocessing, and training sizes must be positive")
     if args.width % args.num_heads:
         raise ValueError("width must be divisible by num_heads")
-    if not 0.0 < args.observed_fraction < 1.0:
-        raise ValueError("observed_fraction must be between zero and one")
-    if not 0.0 < args.train_target_fraction < 1.0:
-        raise ValueError("train_target_fraction must be between zero and one")
+    if not 0.0 < args.mask_target_fraction < 1.0:
+        raise ValueError("mask_target_fraction must be between zero and one")
     if args.workers < 0 or args.patience < 0:
         raise ValueError("workers and patience must be non-negative")
     if args.min_delta < 0 or args.max_grad_norm < 0:
@@ -119,7 +243,7 @@ def _macro_average(per_slice):
     macro = {}
     for name in names:
         values = [metrics[name] for metrics in per_slice.values()]
-        if name.endswith("_valid"):
+        if name.endswith("_valid") or name.endswith("_count"):
             macro[name] = int(sum(values))
         else:
             macro[name] = float(np.mean(values))
@@ -202,10 +326,7 @@ def save_test_predictions(
     prediction_dir = output_dir / "test_predictions"
     prediction_dir.mkdir(exist_ok=True)
     index_payload = []
-    role_slices = prepared.for_role("test")
-    for local_index, (name, slice_info) in enumerate(
-        zip(dataset.slice_names, role_slices)
-    ):
+    for local_index, name in enumerate(dataset.slice_names):
         tagged = dataset.tagged_slice_dataset(local_index)
         loader = _loader(tagged, device, workers)
         values = collect_predictions(
@@ -213,7 +334,6 @@ def save_test_predictions(
             full_neighbors, full_xy,
         )
         values["genes"] = prepared.genes
-        values["target_spots"] = slice_info.data.test_spots
         filename = f"{local_index:03d}_{_safe_name(name)}.npz"
         np.savez(prediction_dir / filename, **values)
         index_payload.append({"slice": name, "file": filename})
@@ -234,14 +354,14 @@ def main(argv=None):
     )
     use_amp = device.type == "cuda" and not args.no_amp
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = resolve_run_manifest(args)
 
     print("Preparing leakage-safe multi-slice Visium data ...")
     prepared = prepare_multislice_visium(
-        manifest_path=args.manifest,
+        manifest_path=str(manifest_path),
         count_file=args.count_file,
         n_genes=args.n_genes,
         target_sum=args.target_sum,
-        observed_fraction=args.observed_fraction,
         seed=args.seed,
     )
     datasets = {
@@ -249,7 +369,7 @@ def main(argv=None):
             prepared,
             role,
             masks_per_slice=args.masks_per_slice,
-            train_target_fraction=args.train_target_fraction,
+            mask_target_fraction=args.mask_target_fraction,
             idw_neighbors=args.query_neighbors,
             seed=args.seed,
         )
@@ -263,7 +383,7 @@ def main(argv=None):
         for item in prepared.slices
     ]
     full_xy = [
-        torch.from_numpy(item.data.physical_xy).to(device)
+        torch.from_numpy(item.data.physical_xy).to(device, dtype=torch.float32)
         for item in prepared.slices
     ]
     generator = torch.Generator().manual_seed(args.seed)
@@ -293,10 +413,13 @@ def main(argv=None):
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     config = vars(args).copy()
-    config["output_dir"] = str(config["output_dir"])
+    for key in ("output_dir", "visium_root", "manifest"):
+        if config[key] is not None:
+            config[key] = str(config[key])
     config.update({
         "model": "VisiumNORMST",
         "protocol": "slice_level_train_val_test",
+        "resolved_manifest": str(manifest_path.resolve()),
         "batch_size": 1,
         "n_selected_genes": len(prepared.genes),
         "train_slices": datasets["train"].slice_names,
@@ -311,10 +434,6 @@ def main(argv=None):
     })
     (args.output_dir / "config.json").write_text(
         json.dumps(config, indent=2), encoding="utf-8"
-    )
-    manifest_text = Path(args.manifest).read_text(encoding="utf-8")
-    (args.output_dir / "manifest.json").write_text(
-        manifest_text, encoding="utf-8"
     )
     np.savetxt(args.output_dir / "genes.txt", prepared.genes, fmt="%s")
     save_preprocessing(args.output_dir, prepared, full_neighbors)
@@ -331,6 +450,7 @@ def main(argv=None):
     stale_epochs = 0
     for epoch in range(args.epochs):
         datasets["train"].set_epoch(epoch)
+        learning_rate_used = optimizer.param_groups[0]["lr"]
         train_started = perf_counter()
         train_metrics = run_epoch(
             "visium",
@@ -353,10 +473,9 @@ def main(argv=None):
             description=f"val {epoch + 1}/{args.epochs}",
         )
         val_seconds = perf_counter() - val_started
-        scheduler.step()
         record = {
             "epoch": epoch + 1,
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rate": learning_rate_used,
             "train_seconds": train_seconds,
             "val_seconds": val_seconds,
             **{f"train_{key}": value for key, value in train_metrics.items()},
@@ -368,6 +487,7 @@ def main(argv=None):
             json.dumps(history, indent=2), encoding="utf-8"
         )
         print(json.dumps(record))
+        scheduler.step()
         checkpoint = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
