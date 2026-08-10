@@ -12,8 +12,10 @@ groups, for example::
       "test": {"151673": "/data/151673"}
     }
 
-HVGs are fitted on all spots from training slices only. Gene-wise RMS scales
-are also fitted there by default and can be disabled with ``--no-rms-scale``.
+HVGs are fitted on raw counts from all spots in training slices only. A
+positive ``--target-sum`` applies library-size normalization before ``log1p``;
+zero or a negative value skips it. Gene-wise RMS scales are fitted on training
+slices by default and can be disabled with ``--no-rms-scale``.
 Every assigned slice contributes all of its generated masks to its own role
 and retains its own physical coordinates and native hex graph.
 """
@@ -73,10 +75,16 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
     parser.add_argument("--n-genes", type=int, default=1000)
-    parser.add_argument("--target-sum", type=float, default=1e4)
+    parser.add_argument(
+        "--target-sum", type=float, default=1e4,
+        help=(
+            "positive value enables library-size normalization before log1p; "
+            "use 0 or -1 to apply log1p directly to raw counts"
+        ),
+    )
     parser.add_argument(
         "--no-rms-scale", action="store_true",
-        help="keep expression in log1p(CP10K) space without gene-wise RMS scaling",
+        help="skip gene-wise RMS scaling after the configured log1p transform",
     )
     parser.add_argument(
         "--mask-target-fraction", "--train-target-fraction",
@@ -271,13 +279,15 @@ def resolve_run_manifest(args):
 
 def validate_args(args):
     positive = (
-        args.n_genes, args.target_sum, args.masks_per_slice,
+        args.n_genes, args.masks_per_slice,
         args.query_neighbors, args.idw_power, args.query_chunk_size,
         args.width, args.num_heads, args.operator_layers, args.epochs,
         args.pca_components,
     )
     if min(positive) <= 0:
         raise ValueError("model, preprocessing, and training sizes must be positive")
+    if not np.isfinite(args.target_sum):
+        raise ValueError("target_sum must be finite")
     if args.width % args.num_heads:
         raise ValueError("width must be divisible by num_heads")
     if not 0.0 < args.mask_target_fraction < 1.0:
@@ -420,6 +430,7 @@ def save_preprocessing(
         slice_roles=np.asarray([item.role for item in prepared.slices]),
         slice_paths=np.asarray([item.path for item in prepared.slices]),
         target_sum=np.asarray(prepared.target_sum, dtype=np.float32),
+        expression_transform=np.asarray(prepared.expression_transform),
         training_gene_std=training_gene_std,
         loss_gene_weight=loss_gene_weight,
     )
@@ -616,6 +627,7 @@ def main(argv=None):
         "task": "visium",
         "model": "VisiumNORMST",
         "protocol": "slice_level_train_val_test",
+        "expression_transform": prepared.expression_transform,
         "checkpoint_metric": "val_macro_reconstruction",
         "resolved_manifest": str(manifest_path.resolve()),
         "batch_size": 1,

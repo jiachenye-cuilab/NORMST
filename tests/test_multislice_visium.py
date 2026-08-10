@@ -100,7 +100,9 @@ class MultiSlicePreparationTest(unittest.TestCase):
             ]
             self.assertEqual(len(assigned), len(set(assigned)))
 
-    def _prepare(self, directory: Path, apply_rms_scale=True):
+    def _prepare(
+        self, directory: Path, apply_rms_scale=True, target_sum=-1.0,
+    ):
         manifest = {
             "train": {"train_a": "train_a", "train_b": "train_b"},
             "val": {"val_a": "val_a"},
@@ -124,7 +126,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
             side_effect=fake_reader,
         ):
             prepared = prepare_multislice_visium(
-                str(manifest_path), n_genes=3, target_sum=1.0,
+                str(manifest_path), n_genes=3, target_sum=target_sum,
                 seed=7, apply_rms_scale=apply_rms_scale,
             )
         return manifest_path, prepared
@@ -135,24 +137,57 @@ class MultiSlicePreparationTest(unittest.TestCase):
         expected_rows = []
         for offset in (0.0, 3.0):
             counts = np.arange(1, 22, dtype=np.float32).reshape(7, 3) + offset
-            library = counts.sum(axis=1)
-            normalized = np.log1p(counts / library[:, None])
-            expected_rows.append(normalized)
+            expected_rows.append(np.log1p(counts))
         expected_scale = np.sqrt(np.mean(np.vstack(expected_rows) ** 2, axis=0))
         np.testing.assert_allclose(
             prepared.gene_scale, expected_scale, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_array_equal(prepared.genes, ["g0", "g1", "g2"])
+        self.assertEqual(prepared.expression_transform, "log1p_raw_counts")
+        self.assertEqual(prepared.target_sum, -1.0)
+        for item, offset in zip(
+            prepared.slices, (0.0, 3.0, 1000.0, 2000.0)
+        ):
+            counts = np.arange(1, 22, dtype=np.float32).reshape(7, 3) + offset
+            expected = np.log1p(counts) / expected_scale[None, :]
+            np.testing.assert_allclose(
+                item.data.expression, expected, rtol=1e-6, atol=1e-6,
+            )
 
-    def test_no_rms_scale_keeps_log1p_cp10k_expression(self):
+    def test_nonpositive_target_sum_keeps_raw_count_log1p_expression(self):
+        for target_sum in (0.0, -1.0):
+            with (
+                self.subTest(target_sum=target_sum),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                _, prepared = self._prepare(
+                    Path(temporary), apply_rms_scale=False,
+                    target_sum=target_sum,
+                )
+            np.testing.assert_array_equal(
+                prepared.gene_scale, np.ones(3, dtype=np.float32),
+            )
+            self.assertEqual(prepared.expression_transform, "log1p_raw_counts")
+            for item, offset in zip(
+                prepared.slices, (0.0, 3.0, 1000.0, 2000.0)
+            ):
+                counts = np.arange(1, 22, dtype=np.float32).reshape(7, 3) + offset
+                expected = np.log1p(counts)
+                np.testing.assert_allclose(
+                    item.data.expression, expected, rtol=1e-6, atol=1e-6,
+                )
+
+    def test_positive_target_sum_applies_library_size_normalization(self):
         with tempfile.TemporaryDirectory() as temporary:
             _, prepared = self._prepare(
-                Path(temporary), apply_rms_scale=False,
+                Path(temporary), apply_rms_scale=False, target_sum=1.0,
             )
-        np.testing.assert_array_equal(
-            prepared.gene_scale, np.ones(3, dtype=np.float32),
+        self.assertEqual(
+            prepared.expression_transform, "log1p_library_size_normalized"
         )
-        for item, offset in zip(prepared.slices, (0.0, 3.0, 1000.0, 2000.0)):
+        for item, offset in zip(
+            prepared.slices, (0.0, 3.0, 1000.0, 2000.0)
+        ):
             counts = np.arange(1, 22, dtype=np.float32).reshape(7, 3) + offset
             library = counts.sum(axis=1)
             expected = np.log1p(counts / library[:, None])
@@ -164,11 +199,13 @@ class MultiSlicePreparationTest(unittest.TestCase):
         base = ["--manifest", "manifest.json", "--output-dir", "output"]
         defaults = parse_args(base)
         self.assertFalse(defaults.no_rms_scale)
+        self.assertEqual(defaults.target_sum, 1e4)
         self.assertEqual(defaults.width, 256)
         self.assertEqual(defaults.operator_layers, 4)
         self.assertFalse(defaults.baseline_calibration)
         self.assertEqual(defaults.loss_gene_weighting, "none")
         self.assertTrue(parse_args(base + ["--no-rms-scale"]).no_rms_scale)
+        self.assertEqual(parse_args(base + ["--target-sum", "-1"]).target_sum, -1)
         aliases = parse_args(base + [
             "--num-layers", "2", "--baseline-calibration",
             "--loss-gene-weighting", "inv_sqrt_std",
@@ -224,7 +261,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                 side_effect=fake_hvg,
             ) as hvg:
                 prepared = prepare_multislice_visium(
-                    str(manifest_path), n_genes=2, target_sum=1.0, seed=7,
+                    str(manifest_path), n_genes=2, seed=7,
                 )
             self.assertEqual(hvg.call_args.kwargs["flavor"], "seurat_v3_paper")
             self.assertEqual(hvg.call_args.kwargs["batch_key"], "slice_id")
@@ -276,6 +313,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                     "--task", "visium",
                     "--manifest", str(manifest_path),
                     "--output-dir", str(output),
+                    "--target-sum", "-1",
                     "--no-rms-scale",
                     "--n-genes", "3",
                     "--masks-per-slice", "1",
@@ -292,6 +330,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                     "--no-amp",
                 ])
             self.assertFalse(prepare.call_args.kwargs["apply_rms_scale"])
+            self.assertEqual(prepare.call_args.kwargs["target_sum"], -1.0)
             expected_files = {
                 "config.json", "manifest.json", "genes.txt",
                 "preprocessing.npz", "history.json", "best.pt", "last.pt",

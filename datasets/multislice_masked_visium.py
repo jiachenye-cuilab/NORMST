@@ -38,6 +38,7 @@ class MultiSliceVisiumData:
     genes: np.ndarray
     gene_scale: np.ndarray
     target_sum: float
+    expression_transform: str
     manifest_path: str
 
     def for_role(self, role: str) -> list[PreparedVisiumSlice]:
@@ -204,8 +205,10 @@ def prepare_multislice_visium(
 ) -> MultiSliceVisiumData:
     """Prepare slice-isolated data without fitting on val/test expression.
 
-    When ``apply_rms_scale`` is false, expression remains in log1p(CP10K)
-    space and ``gene_scale`` is stored as ones for artifact compatibility.
+    A positive ``target_sum`` applies library-size normalization before
+    ``log1p``; zero or a negative value skips it and applies ``log1p`` directly
+    to selected raw counts. When ``apply_rms_scale`` is false, ``gene_scale``
+    is stored as ones for artifact compatibility.
     """
     entries = _manifest_entries(manifest_path, count_file)
     raw_slices = _load_raw_slices(entries)
@@ -220,11 +223,14 @@ def prepare_multislice_visium(
         if np.any(gene_indices < 0):
             raise ValueError(f"selected genes are missing from slice {item.name}")
         counts = item.raw_matrix[:, gene_indices].toarray().astype(np.float32)
-        expression = np.log1p(
-            counts * (
-                target_sum / np.maximum(item.library_size, 1.0)
-            )[:, None]
-        ).astype(np.float32, copy=False)
+        if target_sum > 0:
+            expression = np.log1p(
+                counts * (
+                    target_sum / np.maximum(item.library_size, 1.0)
+                )[:, None]
+            ).astype(np.float32, copy=False)
+        else:
+            expression = np.log1p(counts).astype(np.float32, copy=False)
         unscaled.append(expression)
         if apply_rms_scale and item.role == "train":
             selected = expression.astype(np.float64)
@@ -268,6 +274,10 @@ def prepare_multislice_visium(
         genes=genes,
         gene_scale=gene_scale,
         target_sum=target_sum,
+        expression_transform=(
+            "log1p_library_size_normalized"
+            if target_sum > 0 else "log1p_raw_counts"
+        ),
         manifest_path=str(Path(manifest_path).resolve()),
     )
 
