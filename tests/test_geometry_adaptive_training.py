@@ -22,8 +22,9 @@ from models.geometry_adaptive_normst import (
     VisiumNORMST,
     build_native_hex_neighbors,
 )
-from train_geometry_adaptive_normst import (
-    main,
+from train import main
+from training.engine import (
+    masked_smooth_l1,
     run_epoch,
     structure_aware_visium_loss,
 )
@@ -86,6 +87,20 @@ class JointHDAdapterTest(unittest.TestCase):
 
 
 class TrainingStepTest(unittest.TestCase):
+    def test_gene_weighted_smooth_l1_uses_normalized_per_gene_weights(self):
+        prediction = torch.zeros(1, 2, 2)
+        target = torch.tensor([[[2.0, 1.0], [2.0, 1.0]]])
+        mask = torch.ones(1, 2, 1, dtype=torch.bool)
+        unweighted = masked_smooth_l1(prediction, target, mask)
+        weighted = masked_smooth_l1(
+            prediction,
+            target,
+            mask,
+            gene_weight=torch.tensor([0.5, 1.5]),
+        )
+        self.assertAlmostEqual(float(unweighted), 1.0)
+        self.assertAlmostEqual(float(weighted), 0.75)
+
     def test_structure_aware_loss_penalizes_collapse_and_negative_values(self):
         target = torch.tensor([[[0.0, 2.0], [1.0, 2.0], [2.0, 2.0]]])
         prediction = torch.tensor(
@@ -133,7 +148,7 @@ class TrainingStepTest(unittest.TestCase):
             "min_target_variance": 1e-6,
         }
         with patch(
-            "train_geometry_adaptive_normst.visium_prediction",
+            "training.engine.visium_prediction",
             side_effect=fake_prediction,
         ):
             full = run_epoch(
@@ -142,7 +157,7 @@ class TrainingStepTest(unittest.TestCase):
                 use_amp=False, loss_config=loss_config,
             )
         with patch(
-            "train_geometry_adaptive_normst.visium_prediction",
+            "training.engine.visium_prediction",
             side_effect=fake_prediction,
         ):
             loss_only = run_epoch(
@@ -178,7 +193,7 @@ class TrainingStepTest(unittest.TestCase):
         full_scaler = torch.amp.GradScaler("cpu", enabled=False)
         loss_only_scaler = torch.amp.GradScaler("cpu", enabled=False)
         with patch(
-            "train_geometry_adaptive_normst.visium_prediction",
+            "training.engine.visium_prediction",
             side_effect=fake_prediction,
         ):
             full_metrics = run_epoch(
@@ -221,7 +236,7 @@ class TrainingStepTest(unittest.TestCase):
             )
 
         with patch(
-            "train_geometry_adaptive_normst.visium_prediction",
+            "training.engine.visium_prediction",
             side_effect=fake_prediction,
         ):
             metrics = run_epoch(
@@ -238,7 +253,7 @@ class TrainingStepTest(unittest.TestCase):
         self.assertEqual(metrics["element_count"], 4)
 
         with patch(
-            "train_geometry_adaptive_normst.visium_prediction",
+            "training.engine.visium_prediction",
             side_effect=fake_prediction,
         ):
             loss_only = run_epoch(
@@ -305,47 +320,41 @@ class TrainingStepTest(unittest.TestCase):
         )
         self.assertTrue(np.isfinite(hd_metrics["loss"]))
 
-    def test_visium_main_writes_complete_training_artifacts(self):
-        xy, full_neighbor = artificial_hex()
-        visible_spots = torch.arange(1, 7)
+    def test_visium_hd_main_writes_complete_training_artifacts(self):
         batch = {
-            "visible_expression": torch.randn(6, 3),
-            "visible_coord": xy[visible_spots],
-            "query_coord": xy[:1],
-            "target_values": torch.randn(1, 3),
-            "target_spots": torch.tensor([0]),
-            "visible_spots": visible_spots,
-            "baseline": torch.zeros(1, 3),
+            "inp": torch.randn(2, 2, 2),
+            "input_mask": torch.ones(1, 2, 2),
+            "gt": torch.randn(2, 4, 4),
+            "target_mask": torch.ones(1, 4, 4),
+            "baseline_scale": torch.ones(2),
+            "origin": torch.zeros(2, dtype=torch.long),
         }
         prepared = (
-            VisiumNORMST(n_genes=3, width=8, num_heads=2, num_layers=1),
+            VisiumHDNORMST(n_genes=2, width=8, num_heads=2, num_layers=1),
             {"train": [batch], "val": [batch], "test": [batch]},
-            {
-                "genes": np.asarray(["g0", "g1", "g2"]),
-                "test_spots": np.asarray([0]),
-            },
+            {"genes": np.asarray(["g0", "g1"])},
             {"spatial_representation": "synthetic_test"},
-            full_neighbor,
-            xy,
         )
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "run"
             with patch(
-                "train_geometry_adaptive_normst.prepare_visium",
+                "training.visium_hd.prepare_hd",
                 return_value=prepared,
             ):
                 main([
-                    "--task", "visium",
-                    "--data-dir", "unused",
+                    "--task", "visium_hd",
+                    "--lr-dir", "unused_lr",
+                    "--hr-dir", "unused_hr",
                     "--output-dir", str(output),
-                    "--n-genes", "3",
+                    "--n-genes", "2",
                     "--width", "8",
                     "--num-heads", "2",
                     "--operator-layers", "1",
                     "--epochs", "1",
-                    "--masks-per-epoch", "1",
+                    "--patches-per-epoch", "1",
                     "--device", "cpu",
                     "--no-amp",
+                    "--save-predictions",
                 ])
             expected = {
                 "config.json", "history.json", "best.pt", "last.pt",

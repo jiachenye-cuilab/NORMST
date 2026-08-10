@@ -17,10 +17,11 @@ from datasets.multislice_masked_visium import (
     MultiSlicePointDataset,
     prepare_multislice_visium,
 )
-from train_multislice_visium import (
+from train import main
+from training.visium import (
     build_random_manifest,
     discover_visium_slices,
-    main,
+    fit_training_gene_weights,
     parse_args,
     ratio_4_1_1_counts,
     resolve_run_manifest,
@@ -119,7 +120,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
             return make_adata(offsets[Path(data_dir).name])
 
         with patch(
-            "datasets.multislice_masked_visium._read_standard_visium",
+            "datasets.multislice_masked_visium.read_standard_visium",
             side_effect=fake_reader,
         ):
             prepared = prepare_multislice_visium(
@@ -161,8 +162,39 @@ class MultiSlicePreparationTest(unittest.TestCase):
 
     def test_no_rms_cli_flag_is_opt_in(self):
         base = ["--manifest", "manifest.json", "--output-dir", "output"]
-        self.assertFalse(parse_args(base).no_rms_scale)
+        defaults = parse_args(base)
+        self.assertFalse(defaults.no_rms_scale)
+        self.assertEqual(defaults.width, 256)
+        self.assertEqual(defaults.operator_layers, 4)
+        self.assertFalse(defaults.baseline_calibration)
+        self.assertEqual(defaults.loss_gene_weighting, "none")
         self.assertTrue(parse_args(base + ["--no-rms-scale"]).no_rms_scale)
+        aliases = parse_args(base + [
+            "--num-layers", "2", "--baseline-calibration",
+            "--loss-gene-weighting", "inv_sqrt_std",
+        ])
+        self.assertEqual(aliases.operator_layers, 2)
+        self.assertTrue(aliases.baseline_calibration)
+        self.assertEqual(aliases.loss_gene_weighting, "inv_sqrt_std")
+
+    def test_gene_loss_weights_use_training_slices_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, prepared = self._prepare(
+                Path(temporary), apply_rms_scale=False,
+            )
+        train = np.vstack([
+            item.data.expression for item in prepared.slices
+            if item.role == "train"
+        ])
+        expected_std = train.std(axis=0)
+        standard_deviation, weight = fit_training_gene_weights(
+            prepared, "inv_sqrt_std"
+        )
+        expected_weight = 1.0 / np.sqrt(expected_std + 1e-8)
+        expected_weight /= expected_weight.mean()
+        np.testing.assert_allclose(standard_deviation, expected_std, rtol=1e-5)
+        np.testing.assert_allclose(weight, expected_weight, rtol=1e-5)
+        self.assertAlmostEqual(float(weight.mean()), 1.0, places=6)
 
     def test_hvg_selection_is_batch_aware_and_train_only(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -185,7 +217,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                 adata.var["highly_variable"] = [True, True, False]
 
             with patch(
-                "datasets.multislice_masked_visium._read_standard_visium",
+                "datasets.multislice_masked_visium.read_standard_visium",
                 side_effect=fake_reader,
             ), patch(
                 "datasets.multislice_masked_visium.sc.pp.highly_variable_genes",
@@ -237,10 +269,11 @@ class MultiSlicePreparationTest(unittest.TestCase):
 
             output = root / "output"
             with patch(
-                "train_multislice_visium.prepare_multislice_visium",
+                "training.visium.prepare_multislice_visium",
                 return_value=prepared,
             ) as prepare:
                 main([
+                    "--task", "visium",
                     "--manifest", str(manifest_path),
                     "--output-dir", str(output),
                     "--no-rms-scale",
@@ -251,6 +284,9 @@ class MultiSlicePreparationTest(unittest.TestCase):
                     "--num-heads", "2",
                     "--operator-layers", "1",
                     "--loss-mode", "structure_aware",
+                    "--loss-gene-weighting", "inv_sqrt_std",
+                    "--diagnostics", "pca_reconstruction", "residual_pca",
+                    "latent_rank", "loss_contribution",
                     "--epochs", "1",
                     "--device", "cpu",
                     "--no-amp",
@@ -261,6 +297,7 @@ class MultiSlicePreparationTest(unittest.TestCase):
                 "preprocessing.npz", "history.json", "best.pt", "last.pt",
                 "test_metrics.json", "test_predictions_index.json",
                 "preprocessing_slices", "test_predictions",
+                "diagnostics",
             }
             self.assertEqual(expected_files, {item.name for item in output.iterdir()})
             metrics = json.loads(
@@ -271,6 +308,13 @@ class MultiSlicePreparationTest(unittest.TestCase):
             )
             self.assertTrue(config["no_rms_scale"])
             self.assertEqual(config["loss_mode"], "structure_aware")
+            self.assertEqual(config["loss_gene_weighting"], "inv_sqrt_std")
+            with np.load(output / "preprocessing.npz") as preprocessing:
+                self.assertAlmostEqual(
+                    float(preprocessing["loss_gene_weight"].mean()),
+                    1.0,
+                    places=6,
+                )
             history = json.loads(
                 (output / "history.json").read_text(encoding="utf-8")
             )
@@ -284,6 +328,19 @@ class MultiSlicePreparationTest(unittest.TestCase):
             self.assertEqual(set(metrics["per_slice"]), {"test_a"})
             prediction_files = list((output / "test_predictions").glob("*.npz"))
             self.assertEqual(len(prediction_files), 1)
+            diagnostic_root = output / "diagnostics" / "test"
+            self.assertTrue(
+                (diagnostic_root / "pca_reconstruction_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (diagnostic_root / "residual_pca_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (diagnostic_root / "latent_rank_h0_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (diagnostic_root / "gene_loss_contribution_summary.csv").is_file()
+            )
 
 
 if __name__ == "__main__":

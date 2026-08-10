@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import random
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -14,9 +13,6 @@ import scipy.sparse as sp
 import torch
 from torch.utils.data import Dataset
 from sklearn.decomposition import IncrementalPCA
-
-from utils import make_coord
-
 
 def _read_positions(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".parquet":
@@ -312,7 +308,9 @@ def prepare_visium_hd_pair(
     )
 
 
-class PairedVisiumHDDataset(Dataset):
+class _PairedVisiumHDPatchBase(Dataset):
+    """Shared patch-origin selection for the active joint-gene adapter."""
+
     def __init__(
         self,
         pair: VisiumHDPair,
@@ -323,34 +321,19 @@ class PairedVisiumHDDataset(Dataset):
         deterministic: bool = False,
         origin_stride: Optional[int] = None,
         max_origins: int = 0,
-        context_mode: str = "pca",
         seed: int = 2026,
-        positive_patch_fraction: float = 0.0,
-        positive_sampling_attempts: int = 8,
     ):
         self.pair = pair
         self.split = split
         self.patch_h, self.patch_w = patch_size_lr
         self.repeat = repeat
         self.deterministic = deterministic
-        if context_mode not in {"pca", "shuffled"}:
-            raise ValueError("context_mode must be 'pca' or 'shuffled'")
-        self.context_mode = context_mode
         self.seed = seed
-        if not 0.0 <= positive_patch_fraction <= 1.0:
-            raise ValueError("positive_patch_fraction must be between 0 and 1")
-        if positive_sampling_attempts < 1:
-            raise ValueError("positive_sampling_attempts must be at least 1")
-        self.positive_patch_fraction = positive_patch_fraction
-        self.positive_sampling_attempts = positive_sampling_attempts
         self.origin_stride = origin_stride
         self.origins = self._candidate_origins(min_tissue_fraction)
         if max_origins > 0 and len(self.origins) > max_origins:
             chosen = np.linspace(0, len(self.origins) - 1, max_origins).round().astype(int)
             self.origins = [self.origins[index] for index in chosen]
-        self.context_permutation = np.arange(len(pair.lr_library), dtype=np.int64)
-        if context_mode == "shuffled" and pair.lr_context.shape[1]:
-            np.random.default_rng(seed).shuffle(self.context_permutation)
         if not self.origins:
             raise ValueError(f"No usable {split} patches; reduce patch size or tissue threshold")
 
@@ -373,116 +356,7 @@ class PairedVisiumHDDataset(Dataset):
                     origins.append((row, col))
         return origins
 
-    def __len__(self):
-        if self.deterministic:
-            return len(self.pair.genes) * len(self.origins)
-        return len(self.pair.genes) * self.repeat
-
-    def _extract_context(self, row: int, col: int) -> np.ndarray:
-        channels = self.pair.lr_context.shape[1]
-        result = np.zeros((channels, self.patch_h, self.patch_w), dtype=np.float32)
-        if channels == 0:
-            return result
-        indices = self.pair.lr_row_map[
-            row:row + self.patch_h, col:col + self.patch_w
-        ]
-        valid = indices >= 0
-        observations = indices[valid]
-        if self.context_mode == "shuffled":
-            observations = self.context_permutation[observations]
-        result[:, valid] = self.pair.lr_context[observations].T
-        return result
-
-    @staticmethod
-    def _extract(
-        matrix: sp.csc_matrix,
-        library: np.ndarray,
-        row_map: np.ndarray,
-        gene: int,
-        row: int,
-        col: int,
-        height: int,
-        width: int,
-        target_sum: float,
-    ):
-        indices = row_map[row:row + height, col:col + width]
-        valid = indices >= 0
-        values = np.zeros((height, width), dtype=np.float32)
-        lib_grid = np.zeros((height, width), dtype=np.float32)
-        obs = indices[valid]
-        if len(obs):
-            counts = matrix[obs, gene].toarray().ravel().astype(np.float32)
-            values[valid] = np.log1p(
-                counts * (target_sum / np.maximum(library[obs], 1.0))
-            )
-            lib_grid[valid] = library[obs]
-        return values, valid.astype(np.float32), lib_grid
-
-    def _has_positive_hr(self, gene: int, origin: Tuple[int, int]) -> bool:
-        """Check positivity without densifying an HR patch."""
-        scale = self.pair.scale
-        row, col = origin
-        indices = self.pair.hr_row_map[
-            row * scale:(row + self.patch_h) * scale,
-            col * scale:(col + self.patch_w) * scale,
-        ]
-        observations = indices[indices >= 0]
-        return bool(
-            len(observations)
-            and self.pair.hr_matrix[observations, gene].nnz > 0
-        )
-
-    def __getitem__(self, index):
-        gene = index % len(self.pair.genes)
-        if self.deterministic:
-            origin = self.origins[(index // len(self.pair.genes)) % len(self.origins)]
-        else:
-            origin = random.choice(self.origins)
-        scale = self.pair.scale
-        # Enrich training with patches containing at least one positive HR
-        # observation for the sampled target gene. Validation and test remain
-        # deterministic and retain the natural zero/positive distribution.
-        seek_positive = (
-            not self.deterministic
-            and random.random() < self.positive_patch_fraction
-        )
-        if seek_positive:
-            for _ in range(self.positive_sampling_attempts):
-                candidate = random.choice(self.origins)
-                origin = candidate
-                if self._has_positive_hr(gene, candidate):
-                    break
-        row_lr, col_lr = origin
-        inp, input_mask, _ = self._extract(
-            self.pair.lr_matrix, self.pair.lr_library, self.pair.lr_row_map,
-            gene, row_lr, col_lr, self.patch_h, self.patch_w, self.pair.target_sum,
-        )
-        gt, target_mask, hr_library = self._extract(
-            self.pair.hr_matrix, self.pair.hr_library, self.pair.hr_row_map,
-            gene, row_lr * scale, col_lr * scale,
-            self.patch_h * scale, self.patch_w * scale, self.pair.target_sum,
-        )
-        inp = inp / self.pair.lr_gene_scale[gene]
-        gt = gt / self.pair.hr_gene_scale[gene]
-        context = self._extract_context(row_lr, col_lr)
-        target_shape = (self.patch_h * scale, self.patch_w * scale)
-        return {
-            "inp": torch.from_numpy(inp).unsqueeze(0),
-            "input_mask": torch.from_numpy(input_mask).unsqueeze(0),
-            "gene_context": torch.from_numpy(context),
-            "gt": torch.from_numpy(gt).unsqueeze(0),
-            "target_mask": torch.from_numpy(target_mask).unsqueeze(0),
-            "hr_library": torch.from_numpy(hr_library).unsqueeze(0),
-            "coord": make_coord(target_shape),
-            "cell": torch.tensor([2 / target_shape[0], 2 / target_shape[1]], dtype=torch.float32),
-            "scale": torch.tensor(float(scale), dtype=torch.float32),
-            "lr_gene_scale": torch.tensor(self.pair.lr_gene_scale[gene]),
-            "hr_gene_scale": torch.tensor(self.pair.hr_gene_scale[gene]),
-            "gene_index": torch.tensor(gene, dtype=torch.long),
-        }
-
-
-class JointPairedVisiumHDDataset(PairedVisiumHDDataset):
+class JointPairedVisiumHDDataset(_PairedVisiumHDPatchBase):
     """Paired Visium HD patches containing every selected gene.
 
     The historical paired dataset treats a gene as one sample.  The unified

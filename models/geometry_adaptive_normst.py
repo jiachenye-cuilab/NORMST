@@ -142,6 +142,30 @@ class GeneAffine(nn.Module):
         return expression * self.weight + self.bias
 
 
+class ExpressionEncoder(nn.Module):
+    """Residual gene-expression lifting without coordinate injection."""
+
+    def __init__(self, n_genes: int, width: int):
+        super().__init__()
+        if min(n_genes, width) < 1:
+            raise ValueError("expression encoder dimensions must be positive")
+        self.n_genes = n_genes
+        self.width = width
+        self.skip = nn.Linear(n_genes, width)
+        self.main = nn.Sequential(
+            nn.Linear(n_genes, 2 * width),
+            nn.GELU(),
+            nn.Linear(2 * width, width),
+        )
+
+    def forward(self, expression: torch.Tensor) -> torch.Tensor:
+        if expression.ndim != 3 or expression.shape[-1] != self.n_genes:
+            raise ValueError(
+                f"expression must have shape [B,N,{self.n_genes}]"
+            )
+        return self.skip(expression) + self.main(expression)
+
+
 class PhysicalQueryDecoder(nn.Module):
     """Query visible latent tokens and compute an expression IDW baseline."""
 
@@ -295,12 +319,16 @@ class PhysicalQueryDecoder(nn.Module):
 
 
 class VisiumNORMST(nn.Module):
-    """Masked-location reconstruction on compact visible Visium point tokens."""
+    """Masked-location reconstruction on compact visible Visium point tokens.
+
+    Initial token content comes only from expression. Coordinates remain
+    separate and are used by native relative-edge geometry and physical query.
+    """
 
     def __init__(
         self,
         n_genes: int,
-        width: int = 128,
+        width: int = 256,
         num_heads: int = 8,
         num_layers: int = 4,
         operator_mode: str = "parallel",
@@ -309,14 +337,15 @@ class VisiumNORMST(nn.Module):
         query_neighbors: int = 6,
         idw_power: float = 2.0,
         query_chunk_size: int = 1024,
+        baseline_calibration: bool = False,
     ):
         super().__init__()
         if min(n_genes, width, num_heads, num_layers) < 1:
             raise ValueError("model dimensions must be positive")
         self.n_genes = n_genes
         self.width = width
-        self.expression_lifting = nn.Linear(n_genes, width)
-        self.coordinate_lifting = nn.Linear(2, width, bias=False)
+        self.baseline_calibration_enabled = bool(baseline_calibration)
+        self.expression_encoder = ExpressionEncoder(n_genes, width)
         self.blocks = nn.ModuleList([
             NeuralOperatorBlock(
                 width=width,
@@ -336,12 +365,18 @@ class VisiumNORMST(nn.Module):
             query_chunk_size=query_chunk_size,
         )
         self.residual_projection = nn.Sequential(
-            nn.Linear(width + 2, width),
+            nn.Linear(width + 2, 2 * width),
             nn.GELU(),
-            nn.Linear(width, n_genes),
+            nn.Linear(2 * width, n_genes),
         )
-        self.baseline_calibration = GeneAffine(n_genes)
-        nn.init.zeros_(self.residual_projection[-1].weight)
+        self.baseline_calibration = (
+            GeneAffine(n_genes) if baseline_calibration else nn.Identity()
+        )
+        nn.init.normal_(
+            self.residual_projection[-1].weight,
+            mean=0.0,
+            std=1e-3,
+        )
         nn.init.zeros_(self.residual_projection[-1].bias)
 
     def forward(
@@ -353,7 +388,8 @@ class VisiumNORMST(nn.Module):
         visible_mask: Optional[torch.Tensor] = None,
         query_mask: Optional[torch.Tensor] = None,
         quadrature_weight: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_auxiliary: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if visible_expression.ndim != 3:
             raise ValueError("visible_expression must have shape [B,Nv,G]")
         batch, visible_points, genes = visible_expression.shape
@@ -385,12 +421,9 @@ class VisiumNORMST(nn.Module):
         normalized_visible, normalized_query = _normalize_point_coordinates(
             visible_xy, query_xy, visible_mask
         )
-        token_dtype = visible_expression.dtype
-        tokens = self.expression_lifting(visible_expression)
-        tokens = tokens + self.coordinate_lifting(
-            normalized_visible.to(token_dtype)
-        )
-        tokens = tokens * visible_mask[..., None].to(token_dtype)
+        tokens = self.expression_encoder(visible_expression)
+        tokens = tokens * visible_mask[..., None].to(tokens.dtype)
+        initial_tokens = tokens
         for block in self.blocks:
             tokens = block(
                 tokens,
@@ -411,8 +444,19 @@ class VisiumNORMST(nn.Module):
                 normalized_query.to(query_feature.dtype),
             ], dim=-1)
         )
-        prediction = residual + self.baseline_calibration(baseline)
-        return prediction * query_mask[..., None].to(prediction.dtype)
+        query_weight = query_mask[..., None].to(residual.dtype)
+        baseline = baseline * query_weight
+        prediction = (
+            residual + self.baseline_calibration(baseline)
+        ) * query_weight
+        if not return_auxiliary:
+            return prediction
+        return prediction, {
+            "baseline": baseline,
+            "h0": initial_tokens,
+            "hl": tokens,
+            "visible_mask": visible_mask,
+        }
 
 
 class VisiumHDNORMST(nn.Module):

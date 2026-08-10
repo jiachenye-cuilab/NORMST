@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 
 from models.geometry_adaptive_normst import (
+    ExpressionEncoder,
+    GeneAffine,
     VisiumHDNORMST,
     VisiumNORMST,
     build_native_hex_neighbors,
@@ -222,14 +224,14 @@ class GridAndBlockSanityTest(unittest.TestCase):
 
 
 class EndToEndSanityTest(unittest.TestCase):
-    def test_joint_1000_gene_shapes_and_independent_parameters(self):
+    def test_joint_1000_gene_width_256_shape(self):
         torch.manual_seed(7)
         xy, full_neighbor = artificial_hex()
         geometry = build_visible_native_neighbor_graph(
             full_neighbor, xy, torch.arange(7)
         )
         visium = VisiumNORMST(
-            n_genes=1000, width=8, num_heads=2, num_layers=1
+            n_genes=1000, width=256, num_heads=8, num_layers=1
         )
         hd = VisiumHDNORMST(
             n_genes=1000, width=8, num_heads=2, num_layers=1
@@ -243,13 +245,38 @@ class EndToEndSanityTest(unittest.TestCase):
         grid_output = hd(torch.randn(1, 1000, 2, 2))
         self.assertEqual(point_output.shape, (1, 2, 1000))
         self.assertEqual(grid_output.shape, (1, 1000, 4, 4))
+        self.assertIsInstance(visium.expression_encoder, ExpressionEncoder)
         self.assertIsInstance(visium.blocks[0], NeuralOperatorBlock)
         self.assertIsInstance(hd.blocks[0], NeuralOperatorBlock)
         visium_storage = {parameter.data_ptr() for parameter in visium.parameters()}
         hd_storage = {parameter.data_ptr() for parameter in hd.parameters()}
         self.assertTrue(visium_storage.isdisjoint(hd_storage))
 
-    def test_visium_initial_prediction_is_exact_idw(self):
+    def test_visium_initial_tokens_use_expression_only(self):
+        torch.manual_seed(8)
+        xy, full_neighbor = artificial_hex()
+        geometry = build_visible_native_neighbor_graph(
+            full_neighbor, xy, torch.arange(7)
+        )
+        expression = torch.randn(1, 7, 3)
+        model = VisiumNORMST(
+            n_genes=3, width=8, num_heads=2, num_layers=1
+        )
+        captured = []
+        handle = model.blocks[0].register_forward_pre_hook(
+            lambda _module, arguments: captured.append(arguments[0].detach())
+        )
+        try:
+            model(expression, xy[None], xy[:2][None], geometry)
+        finally:
+            handle.remove()
+        self.assertFalse(hasattr(model, "coordinate_lifting"))
+        self.assertEqual(len(captured), 1)
+        torch.testing.assert_close(
+            captured[0], model.expression_encoder(expression)
+        )
+
+    def test_visium_initial_prediction_is_near_but_not_equal_to_idw(self):
         torch.manual_seed(5)
         xy, full_neighbor = artificial_hex()
         expression = torch.randn(7, 3)
@@ -264,11 +291,127 @@ class EndToEndSanityTest(unittest.TestCase):
             num_layers=1,
             query_neighbors=3,
         )
-        prediction = model(
-            expression[None], xy[None], query[None], geometry
-        )[0]
+        prediction, auxiliary = model(
+            expression[None], xy[None], query[None], geometry,
+            return_auxiliary=True,
+        )
+        prediction = prediction[0]
         expected = manual_idw(expression, xy, query, neighbors=3)
-        torch.testing.assert_close(prediction, expected, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(auxiliary["baseline"][0], expected)
+        self.assertLess(float((prediction - expected).abs().max().detach()), 0.05)
+        self.assertFalse(torch.equal(prediction, expected))
+
+    def test_variable_points_padding_query_mask_and_query_chunking(self):
+        torch.manual_seed(9)
+        xy, full_neighbor = artificial_hex()
+        expression = torch.randn(1, 7, 4)
+        query = torch.tensor([[[0.1, 0.1], [-0.2, 0.3], [0.4, -0.1]]])
+        geometry = build_visible_native_neighbor_graph(
+            full_neighbor, xy, torch.arange(7)
+        )
+        model = VisiumNORMST(
+            n_genes=4, width=8, num_heads=2, num_layers=1,
+            query_neighbors=3, query_chunk_size=1,
+        )
+        for visible_index, query_count in (
+            (torch.arange(6), 1),
+            (torch.arange(7), 3),
+        ):
+            variable_geometry = build_visible_native_neighbor_graph(
+                full_neighbor, xy, visible_index
+            )
+            variable = model(
+                expression[:, visible_index],
+                xy[visible_index][None],
+                query[:, :query_count],
+                variable_geometry,
+            )
+            self.assertEqual(variable.shape, (1, query_count, 4))
+        reference = model(expression, xy[None], query, geometry)
+        self.assertEqual(reference.shape, (1, 3, 4))
+
+        padded_expression = torch.cat(
+            [expression, torch.randn(1, 2, 4)], dim=1
+        )
+        padded_xy = torch.cat([xy, torch.randn(2, 2)], dim=0)
+        padded_geometry = HexGeometry(
+            torch.cat([
+                geometry.neighbor_index,
+                torch.full((2, 6), -1, dtype=torch.long),
+            ]),
+            torch.cat([
+                geometry.relative_xy,
+                torch.zeros(2, 6, 2),
+            ]),
+            torch.cat([
+                geometry.neighbor_mask,
+                torch.zeros(2, 6, dtype=torch.bool),
+            ]),
+        )
+        padded = model(
+            padded_expression,
+            padded_xy[None],
+            query,
+            padded_geometry,
+            visible_mask=torch.tensor([[
+                True, True, True, True, True, True, True, False, False,
+            ]]),
+            query_mask=torch.tensor([[True, True, False]]),
+        )
+        torch.testing.assert_close(padded[:, :2], reference[:, :2])
+        self.assertTrue(torch.equal(padded[:, 2], torch.zeros_like(padded[:, 2])))
+
+    def test_optional_baseline_calibration_and_first_backward_gradients(self):
+        torch.manual_seed(10)
+        xy, full_neighbor = artificial_hex()
+        geometry = build_visible_native_neighbor_graph(
+            full_neighbor, xy, torch.arange(7)
+        )
+        expression = torch.randn(1, 7, 5)
+        query = torch.tensor([[[0.2, 0.1], [-0.3, 0.2]]])
+        fixed = VisiumNORMST(
+            n_genes=5, width=8, num_heads=2, num_layers=1,
+            baseline_calibration=False,
+        )
+        self.assertIsInstance(fixed.baseline_calibration, torch.nn.Identity)
+        prediction = fixed(expression, xy[None], query, geometry)
+        prediction.square().mean().backward()
+        for module in (
+            fixed.expression_encoder,
+            fixed.blocks,
+            fixed.query_decoder.edge_encoder,
+        ):
+            gradient = sum(
+                float(parameter.grad.abs().sum())
+                for parameter in module.parameters()
+                if parameter.grad is not None
+            )
+            self.assertGreater(gradient, 0.0)
+
+        calibrated = VisiumNORMST(
+            n_genes=5, width=8, num_heads=2, num_layers=1,
+            baseline_calibration=True,
+        )
+        incompatible = calibrated.load_state_dict(
+            fixed.state_dict(), strict=False
+        )
+        self.assertEqual(
+            set(incompatible.missing_keys),
+            {"baseline_calibration.weight", "baseline_calibration.bias"},
+        )
+        self.assertFalse(incompatible.unexpected_keys)
+        self.assertIsInstance(calibrated.baseline_calibration, GeneAffine)
+        with torch.no_grad():
+            calibrated.baseline_calibration.weight.fill_(1.5)
+            calibrated.baseline_calibration.bias.fill_(0.2)
+        calibrated_prediction, auxiliary = calibrated(
+            expression, xy[None], query, geometry, return_auxiliary=True
+        )
+        uncalibrated_baseline = auxiliary["baseline"]
+        torch.testing.assert_close(
+            calibrated_prediction - prediction,
+            0.5 * uncalibrated_baseline + 0.2,
+        )
 
     def test_tiny_visium_and_hd_overfit(self):
         torch.manual_seed(6)

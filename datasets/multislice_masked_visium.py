@@ -14,11 +14,11 @@ import torch
 from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 
-from datasets.masked_visium import (
-    MaskedVisiumData,
-    _as_csr,
-    _read_standard_visium,
-    _spot_geometry,
+from datasets.visium_common import (
+    VisiumSliceData,
+    as_csr,
+    read_standard_visium,
+    spot_geometry,
 )
 
 
@@ -27,7 +27,7 @@ class PreparedVisiumSlice:
     name: str
     role: str
     path: str
-    data: MaskedVisiumData
+    data: VisiumSliceData
     array_row: np.ndarray
     array_col: np.ndarray
 
@@ -56,8 +56,6 @@ class _RawSlice:
     cols: np.ndarray
     row_map: np.ndarray
     physical_xy: np.ndarray
-    physical_coord_grid: np.ndarray
-    row_parity: np.ndarray
     array_row: np.ndarray
     array_col: np.ndarray
     observed_spots: np.ndarray
@@ -121,13 +119,11 @@ def _manifest_entries(manifest_path: str, default_count_file: str):
 def _load_raw_slices(entries):
     raw_slices = []
     for entry in entries:
-        adata = _read_standard_visium(entry["path"], entry["count_file"])
+        adata = read_standard_visium(entry["path"], entry["count_file"])
         keep = ~adata.var_names.str.startswith("DEPRECATED_")
         adata = adata[:, keep].copy()
-        rows, cols, row_map, physical_xy, coord_grid, row_parity = _spot_geometry(
-            adata
-        )
-        raw_matrix = _as_csr(adata.X)
+        rows, cols, row_map, physical_xy = spot_geometry(adata)
+        raw_matrix = as_csr(adata.X)
         library_size = np.asarray(raw_matrix.sum(axis=1)).ravel().astype(np.float32)
         all_spots = np.arange(len(rows), dtype=np.int64)
         array_row = adata.obs["array_row"].to_numpy(np.int64).copy()
@@ -143,8 +139,6 @@ def _load_raw_slices(entries):
             cols=cols,
             row_map=row_map,
             physical_xy=physical_xy,
-            physical_coord_grid=coord_grid,
-            row_parity=row_parity,
             array_row=array_row,
             array_col=array_col,
             observed_spots=all_spots,
@@ -248,27 +242,15 @@ def prepare_multislice_visium(
     for item, expression in zip(raw_slices, unscaled):
         if apply_rms_scale:
             expression = expression / gene_scale[None, :]
-        empty_context = np.empty((len(expression), 0), dtype=np.float32)
-        empty = np.empty((0,), dtype=np.float32)
         empty_index = np.empty((0,), dtype=np.int64)
-        data = MaskedVisiumData(
+        data = VisiumSliceData(
             expression=expression,
             genes=genes,
             gene_scale=gene_scale,
-            context=empty_context,
-            context_mean=empty,
-            context_components=np.empty((0, len(genes)), dtype=np.float32),
-            context_scale=empty,
-            context_explained_variance_ratio=empty,
             row_map=item.row_map,
             spot_rows=item.rows,
             spot_cols=item.cols,
             physical_xy=item.physical_xy,
-            physical_coord_grid=item.physical_coord_grid,
-            row_parity=item.row_parity,
-            physical_query_indices=empty_index,
-            physical_query_relative=empty,
-            physical_query_mask=empty,
             observed_spots=item.observed_spots,
             validation_spots=empty_index,
             test_spots=empty_index,
@@ -315,7 +297,7 @@ class _WholeSliceMaskDataset(Dataset):
 
     def __init__(
         self,
-        data: MaskedVisiumData,
+        data: VisiumSliceData,
         role: str,
         masks_per_slice: int,
         target_fraction: float,
