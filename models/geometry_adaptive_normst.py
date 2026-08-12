@@ -334,6 +334,7 @@ class VisiumNORMST(nn.Module):
         operator_mode: str = "parallel",
         fusion: str = "add",
         learnable_alpha: bool = False,
+        alpha_global: float = 1.0,
         query_neighbors: int = 6,
         idw_power: float = 2.0,
         query_chunk_size: int = 1024,
@@ -354,6 +355,7 @@ class VisiumNORMST(nn.Module):
                 mode=operator_mode,
                 fusion=fusion,
                 learnable_alpha=learnable_alpha,
+                alpha_global=alpha_global,
             )
             for _ in range(num_layers)
         ])

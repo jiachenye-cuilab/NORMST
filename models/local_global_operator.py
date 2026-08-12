@@ -8,6 +8,7 @@ can retain its Cartesian grid for the local branch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 import torch
@@ -269,6 +270,7 @@ class NeuralOperatorBlock(nn.Module):
         mode: str = "parallel",
         fusion: str = "add",
         learnable_alpha: bool = False,
+        alpha_global: float = 1.0,
         project_branches: bool = True,
         ffn_expansion: int = 2,
     ):
@@ -279,6 +281,9 @@ class NeuralOperatorBlock(nn.Module):
             raise ValueError("fusion must be add or concat")
         if width < 1 or ffn_expansion < 1:
             raise ValueError("width and ffn_expansion must be positive")
+        alpha_global = float(alpha_global)
+        if not math.isfinite(alpha_global) or alpha_global < 0:
+            raise ValueError("alpha_global must be finite and non-negative")
         uses_local = mode != "galerkin_only"
         uses_global = mode != "local_only"
         if uses_local and local_operator is None:
@@ -296,10 +301,12 @@ class NeuralOperatorBlock(nn.Module):
         self.global_projection = projection(width, width) if uses_global else None
         if learnable_alpha:
             self.alpha_local = nn.Parameter(torch.ones(()))
-            self.alpha_global = nn.Parameter(torch.ones(()))
+            self.alpha_global = nn.Parameter(torch.tensor(alpha_global))
         else:
             self.register_buffer("alpha_local", torch.ones(()), persistent=True)
-            self.register_buffer("alpha_global", torch.ones(()), persistent=True)
+            self.register_buffer(
+                "alpha_global", torch.tensor(alpha_global), persistent=True
+            )
         self.concat_projection = (
             nn.Sequential(
                 nn.Linear(3 * width, width),

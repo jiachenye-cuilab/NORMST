@@ -120,6 +120,12 @@ def parse_args(argv=None):
     parser.add_argument("--fusion", choices=("add", "concat"), default="add")
     parser.add_argument("--learnable-alpha", action="store_true")
     parser.add_argument(
+        "--alpha-global", type=float, default=1.0,
+        help=(
+            "initial global residual scale; fixed unless --learnable-alpha is set"
+        ),
+    )
+    parser.add_argument(
         "--baseline-calibration", action="store_true",
         help="enable identity-initialized learned gene-wise IDW scale and bias",
     )
@@ -288,6 +294,8 @@ def validate_args(args):
         raise ValueError("model, preprocessing, and training sizes must be positive")
     if not np.isfinite(args.target_sum):
         raise ValueError("target_sum must be finite")
+    if not np.isfinite(args.alpha_global) or args.alpha_global < 0:
+        raise ValueError("alpha_global must be finite and non-negative")
     if args.width % args.num_heads:
         raise ValueError("width must be divisible by num_heads")
     if not 0.0 < args.mask_target_fraction < 1.0:
@@ -606,6 +614,7 @@ def main(argv=None):
         operator_mode=args.operator_mode,
         fusion=args.fusion,
         learnable_alpha=args.learnable_alpha,
+        alpha_global=args.alpha_global,
         query_neighbors=args.query_neighbors,
         idw_power=args.idw_power,
         query_chunk_size=args.query_chunk_size,
