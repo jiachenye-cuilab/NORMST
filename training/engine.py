@@ -317,8 +317,6 @@ def run_epoch(
     if loss_mode == "structure_aware" and task != "visium":
         raise ValueError("structure-aware loss is currently defined for Visium only")
     model.train(training)
-    loss_only_sum = torch.zeros((), device=device, dtype=torch.float32)
-    loss_only_count = torch.zeros((), device=device, dtype=torch.long)
     totals = {
         "smooth_l1_sum": 0.0, "squared_error_sum": 0.0,
         "absolute_error_sum": 0.0, "element_count": 0,
@@ -338,6 +336,7 @@ def run_epoch(
         "baseline_spot_pearson_count": 0,
         "batches": 0,
         "objective_sum": 0.0,
+        "objective_count": 0,
         "gene_correlation_loss_sum": 0.0,
         "variance_loss_sum": 0.0,
         "negative_loss_sum": 0.0,
@@ -383,15 +382,20 @@ def run_epoch(
                 scaler.step(optimizer)
                 scaler.update()
 
+            if loss_mode == "structure_aware" or gene_weight is not None:
+                objective_count = 1
+            else:
+                expansion = prediction.numel() // mask.numel()
+                objective_count = int(mask.count_nonzero().item()) * expansion
+            totals["objective_sum"] += float(loss.detach()) * objective_count
+            totals["objective_count"] += objective_count
+            progress.set_postfix(
+                objective_loss=(
+                    f"{totals['objective_sum'] / max(totals['objective_count'], 1):.4f}"
+                )
+            )
+
             if not detailed_metrics:
-                if loss_mode == "structure_aware":
-                    loss_only_sum += loss.detach().float()
-                    loss_only_count += 1
-                else:
-                    expansion = prediction.numel() // mask.numel()
-                    element_count = mask.count_nonzero() * expansion
-                    loss_only_sum += loss.detach().float() * element_count
-                    loss_only_count += element_count
                 continue
 
             expanded_mask = mask.bool().expand_as(prediction)
@@ -465,7 +469,6 @@ def run_epoch(
                 )
                 totals["baseline_spot_pearson_count"] += baseline_spots.numel()
             totals["batches"] += 1
-            totals["objective_sum"] += float(loss.detach())
             if loss_terms is not None:
                 totals["gene_correlation_loss_sum"] += float(
                     loss_terms["gene_correlation"].detach()
@@ -479,15 +482,12 @@ def run_epoch(
                 totals["structure_valid_gene_count"] += int(
                     loss_terms["valid_genes"].detach()
                 )
-            progress.set_postfix(
-                loss=(
-                    f"{totals['smooth_l1_sum'] / max(totals['element_count'], 1):.4f}"
-                )
-            )
 
     if not detailed_metrics:
-        pooled_loss = loss_only_sum / loss_only_count.clamp_min(1)
-        return {"loss": float(pooled_loss)}
+        return {
+            "loss": totals["objective_sum"]
+            / max(totals["objective_count"], 1)
+        }
 
     element_count = max(totals["element_count"], 1)
     positive_count = max(totals["positive_count"], 1)
@@ -505,10 +505,8 @@ def run_epoch(
         prediction_variance = float(
             gene_variance[valid_gene].mean() if valid_gene.any() else 0.0
         )
-    objective_loss = (
-        totals["objective_sum"] / max(totals["batches"], 1)
-        if loss_mode == "structure_aware" or gene_weight is not None
-        else pooled_loss
+    objective_loss = totals["objective_sum"] / max(
+        totals["objective_count"], 1
     )
     metrics = {
         "loss": objective_loss,
