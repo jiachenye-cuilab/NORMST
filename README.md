@@ -37,6 +37,21 @@ library-size normalization before `log1p`; use `--target-sum -1` or `0` for
 records pooled loss only; validation and test retain complete per-slice and
 equal-slice macro metrics.
 
+Test prediction arrays are not saved after training by default. Add
+`--save-predictions` to export them immediately. A downloaded run can recreate
+the same test predictions later by loading its saved model and preprocessing
+contract; the supplied manifest must point to locally accessible slice paths:
+
+```bash
+python train.py --task visium \
+  --output-dir save/multislice/seed2027 \
+  --manifest /local/path/manifest.json \
+  --predict-only
+```
+
+`--predict-only` loads `best.pt` by default; use `--checkpoint` to select a
+different checkpoint.
+
 ### Paired Visium HD
 
 ```bash

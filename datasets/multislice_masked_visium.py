@@ -202,6 +202,8 @@ def prepare_multislice_visium(
     target_sum: float = 1e4,
     seed: int = 2026,
     apply_rms_scale: bool = True,
+    fixed_genes: np.ndarray | None = None,
+    fixed_gene_scale: np.ndarray | None = None,
 ) -> MultiSliceVisiumData:
     """Prepare slice-isolated data without fitting on val/test expression.
 
@@ -210,10 +212,24 @@ def prepare_multislice_visium(
     to selected raw counts. When ``apply_rms_scale`` is false, ``gene_scale``
     is stored as ones for artifact compatibility.
     """
+    if fixed_gene_scale is not None and fixed_genes is None:
+        raise ValueError("fixed_gene_scale requires fixed_genes")
     entries = _manifest_entries(manifest_path, count_file)
     raw_slices = _load_raw_slices(entries)
     common = _common_genes(raw_slices)
-    genes = _select_training_hvgs(raw_slices, common, n_genes)
+    if fixed_genes is None:
+        genes = _select_training_hvgs(raw_slices, common, n_genes)
+    else:
+        genes = np.asarray(fixed_genes, dtype=str)
+        if genes.ndim != 1 or len(genes) < 1:
+            raise ValueError("fixed_genes must be a non-empty one-dimensional array")
+        if len(np.unique(genes)) != len(genes):
+            raise ValueError("fixed_genes must not contain duplicates")
+        missing = np.setdiff1d(genes, common)
+        if len(missing):
+            raise ValueError(
+                f"fixed genes are missing from one or more slices: {missing[:5].tolist()}"
+            )
 
     unscaled = []
     squared_sum = np.zeros(len(genes), dtype=np.float64)
@@ -236,7 +252,13 @@ def prepare_multislice_visium(
             selected = expression.astype(np.float64)
             squared_sum += np.square(selected).sum(axis=0)
             training_count += len(selected)
-    if apply_rms_scale:
+    if fixed_gene_scale is not None:
+        gene_scale = np.asarray(fixed_gene_scale, dtype=np.float32)
+        if gene_scale.shape != (len(genes),):
+            raise ValueError("fixed_gene_scale must align with fixed_genes")
+        if not np.isfinite(gene_scale).all() or np.any(gene_scale <= 0):
+            raise ValueError("fixed_gene_scale must be finite and positive")
+    elif apply_rms_scale:
         if training_count < 1:
             raise ValueError("no training spots are available for RMS fitting")
         gene_scale = np.sqrt(squared_sum / training_count).astype(np.float32)

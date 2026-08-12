@@ -63,7 +63,7 @@ POSITION_FILES = (
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument(
         "--visium-root", type=Path,
         help="directory whose direct children are standard Visium slices",
@@ -73,6 +73,21 @@ def parse_args(argv=None):
         help="optional prebuilt slice-level split manifest",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint", type=Path,
+        help="checkpoint for --predict-only; defaults to output_dir/best.pt",
+    )
+    parser.add_argument(
+        "--predict-only", action="store_true",
+        help=(
+            "load a completed run and export test predictions without training; "
+            "model and preprocessing settings come from output_dir"
+        ),
+    )
+    parser.add_argument(
+        "--save-predictions", action="store_true",
+        help="export test_predictions after training (disabled by default)",
+    )
     parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
     parser.add_argument("--n-genes", type=int, default=1000)
     parser.add_argument(
@@ -284,6 +299,17 @@ def resolve_run_manifest(args):
 
 
 def validate_args(args):
+    if not args.predict_only and args.visium_root is None and args.manifest is None:
+        raise ValueError("training requires --visium-root or --manifest")
+    if args.predict_only and args.visium_root is not None:
+        raise ValueError(
+            "--predict-only uses the saved split; pass a local --manifest instead "
+            "of --visium-root"
+        )
+    if args.predict_only and args.save_predictions:
+        raise ValueError("--predict-only already exports predictions")
+    if not args.predict_only and args.checkpoint is not None:
+        raise ValueError("--checkpoint is only valid with --predict-only")
     positive = (
         args.n_genes, args.masks_per_slice,
         args.query_neighbors, args.idw_power, args.query_chunk_size,
@@ -550,10 +576,131 @@ def trainable_parameter_breakdown(model):
     return result
 
 
+def _existing_file(label, candidates):
+    checked = []
+    for value in candidates:
+        if value is None:
+            continue
+        path = Path(value)
+        checked.append(str(path))
+        if path.is_file():
+            return path.resolve()
+    raise FileNotFoundError(f"{label} was not found; checked: {', '.join(checked)}")
+
+
+def _model_from_config(config, n_genes, device):
+    return VisiumNORMST(
+        n_genes=n_genes,
+        width=int(config.get("width", 256)),
+        num_heads=int(config.get("num_heads", 8)),
+        num_layers=int(config.get(
+            "operator_layers", config.get("num_layers", 4)
+        )),
+        operator_mode=config.get("operator_mode", "parallel"),
+        fusion=config.get("fusion", "add"),
+        learnable_alpha=bool(config.get("learnable_alpha", False)),
+        alpha_global=float(config.get("alpha_global", 1.0)),
+        query_neighbors=int(config.get(
+            "query_neighbors", config.get("idw_neighbors", 6)
+        )),
+        idw_power=float(config.get("idw_power", 2.0)),
+        query_chunk_size=int(config.get("query_chunk_size", 1024)),
+        baseline_calibration=bool(config.get("baseline_calibration", False)),
+    ).to(device)
+
+
+def run_prediction_only(args, device, use_amp):
+    run_dir = args.output_dir.resolve()
+    config_path = _existing_file("training config", [run_dir / "config.json"])
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    checkpoint_path = _existing_file(
+        "checkpoint", [args.checkpoint, run_dir / "best.pt"]
+    )
+    manifest_path = _existing_file(
+        "manifest",
+        [
+            args.manifest,
+            run_dir / "manifest.json",
+            config.get("resolved_manifest"),
+        ],
+    )
+    preprocessing_path = _existing_file(
+        "preprocessing", [run_dir / "preprocessing.npz"]
+    )
+    genes_path = _existing_file("genes", [run_dir / "genes.txt"])
+    genes = np.atleast_1d(np.loadtxt(genes_path, dtype=str))
+    with np.load(preprocessing_path, allow_pickle=False) as preprocessing:
+        preprocessing_genes = preprocessing["genes"].astype(str)
+        gene_scale = preprocessing["gene_scale"].astype(np.float32)
+    if not np.array_equal(genes, preprocessing_genes):
+        raise ValueError(
+            "genes.txt and preprocessing.npz contain different gene orders"
+        )
+
+    seed = int(config.get("seed", 2026))
+    seed_everything(seed)
+    prepared = prepare_multislice_visium(
+        manifest_path=str(manifest_path),
+        count_file=config.get("count_file", "filtered_feature_bc_matrix.h5"),
+        n_genes=len(genes),
+        target_sum=float(config.get("target_sum", 1e4)),
+        seed=seed,
+        apply_rms_scale=not bool(config.get("no_rms_scale", False)),
+        fixed_genes=genes,
+        fixed_gene_scale=gene_scale,
+    )
+    query_neighbors = int(config.get(
+        "query_neighbors", config.get("idw_neighbors", 6)
+    ))
+    dataset = MultiSlicePointDataset(
+        prepared,
+        "test",
+        masks_per_slice=int(config.get("masks_per_slice", 64)),
+        mask_target_fraction=float(config.get("mask_target_fraction", 0.25)),
+        idw_neighbors=query_neighbors,
+        seed=seed,
+        materialize_values=False,
+    )
+    full_neighbors = [
+        build_native_hex_neighbors(
+            torch.from_numpy(item.array_row),
+            torch.from_numpy(item.array_col),
+        ).to(device)
+        for item in prepared.slices
+    ]
+    full_xy = [
+        torch.from_numpy(item.data.physical_xy).to(device, dtype=torch.float32)
+        for item in prepared.slices
+    ]
+    full_expression = [
+        torch.from_numpy(item.data.expression).to(device, dtype=torch.float32)
+        for item in prepared.slices
+    ]
+    model = _model_from_config(config, len(prepared.genes), device)
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=True
+    )
+    model.load_state_dict(checkpoint.get("model", checkpoint))
+    model.eval()
+    save_test_predictions(
+        run_dir,
+        model,
+        dataset,
+        prepared,
+        device,
+        use_amp,
+        full_neighbors,
+        full_xy,
+        full_expression,
+        args.workers,
+    )
+    print(f"Saved test predictions to {run_dir / 'test_predictions'}")
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
     validate_args(args)
-    seed_everything(args.seed)
     requested_device = torch.device(args.device)
     device = (
         torch.device("cpu")
@@ -561,6 +708,10 @@ def main(argv=None):
         else requested_device
     )
     use_amp = device.type == "cuda" and not args.no_amp
+    if args.predict_only:
+        return run_prediction_only(args, device, use_amp)
+
+    seed_everything(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = resolve_run_manifest(args)
 
@@ -639,7 +790,7 @@ def main(argv=None):
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     config = vars(args).copy()
-    for key in ("output_dir", "visium_root", "manifest"):
+    for key in ("output_dir", "visium_root", "manifest", "checkpoint"):
         if config[key] is not None:
             config[key] = str(config[key])
     config.update({
@@ -770,11 +921,12 @@ def main(argv=None):
     (args.output_dir / "test_metrics.json").write_text(
         json.dumps(test_metrics, indent=2), encoding="utf-8"
     )
-    save_test_predictions(
-        args.output_dir, model, datasets["test"], prepared,
-        device, use_amp, full_neighbors, full_xy, full_expression,
-        args.workers,
-    )
+    if args.save_predictions:
+        save_test_predictions(
+            args.output_dir, model, datasets["test"], prepared,
+            device, use_amp, full_neighbors, full_xy, full_expression,
+            args.workers,
+        )
     if args.diagnostics:
         diagnostic_datasets = {
             role: MultiSlicePointDataset(
@@ -803,3 +955,4 @@ def main(argv=None):
                 args.pca_components,
             )
     print("Test:", json.dumps(test_metrics))
+    return 0
