@@ -70,6 +70,7 @@ def build_visible_native_neighbor_graph(
     full_neighbor_index: torch.Tensor,
     full_xy: torch.Tensor,
     visible_index: torch.Tensor,
+    validate_indices: bool = True,
 ) -> HexGeometry:
     """Restrict a complete native hex graph to one visible subset.
 
@@ -87,10 +88,11 @@ def build_visible_native_neighbor_graph(
         raise ValueError("visible_index must be a one-dimensional long tensor")
     if visible_index.numel() < 1:
         raise ValueError("at least one visible point is required")
-    if visible_index.min().item() < 0 or visible_index.max().item() >= points:
-        raise ValueError("visible_index is out of bounds")
-    if visible_index.unique().numel() != visible_index.numel():
-        raise ValueError("visible_index must not contain duplicates")
+    if validate_indices:
+        if visible_index.min().item() < 0 or visible_index.max().item() >= points:
+            raise ValueError("visible_index is out of bounds")
+        if visible_index.unique().numel() != visible_index.numel():
+            raise ValueError("visible_index must not contain duplicates")
 
     device = full_neighbor_index.device
     visible_index = visible_index.to(device)
@@ -98,7 +100,11 @@ def build_visible_native_neighbor_graph(
     lookup[visible_index] = torch.arange(visible_index.numel(), device=device)
     native = full_neighbor_index[visible_index]
     safe_native = native.clamp(min=0)
-    if safe_native.numel() and safe_native.max().item() >= points:
+    if (
+        validate_indices
+        and safe_native.numel()
+        and safe_native.max().item() >= points
+    ):
         raise ValueError("full native neighbor index is out of bounds")
     present = native >= 0
     compact = lookup[safe_native]
@@ -109,7 +115,9 @@ def build_visible_native_neighbor_graph(
     target_xy = full_xy.to(device)[visible_index, None, :]
     relative = source_xy - target_xy
     relative = torch.where(present[..., None], relative, torch.zeros_like(relative))
-    return HexGeometry(compact, relative, present)
+    return HexGeometry(
+        compact, relative, present, indices_validated=True
+    )
 
 
 def _normalize_point_coordinates(

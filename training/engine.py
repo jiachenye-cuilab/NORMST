@@ -12,6 +12,12 @@ from tqdm import tqdm
 from models.geometry_adaptive_normst import build_visible_native_neighbor_graph
 
 
+_CPU_METADATA_KEYS = frozenset({
+    "origin", "slice_index", "target_spots", "visible_spots"
+})
+_TRAIN_PROGRESS_INTERVAL = 10
+
+
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -22,7 +28,11 @@ def seed_everything(seed: int):
 
 def move_batch(batch, device):
     return {
-        key: value.to(device, non_blocking=True)
+        key: (
+            value
+            if key in _CPU_METADATA_KEYS
+            else value.to(device, non_blocking=True)
+        )
         for key, value in batch.items()
     }
 
@@ -243,7 +253,8 @@ def correlation_values(prediction, target, mask, task):
 
 
 def visium_prediction(
-    model, batch, full_neighbor, full_xy, return_latents=False
+    model, batch, full_neighbor, full_xy, return_latents=False,
+    full_expression=None,
 ):
     if batch["visible_spots"].shape[0] != 1:
         raise ValueError("compact Visium graph construction requires batch size one")
@@ -253,18 +264,36 @@ def visium_prediction(
         slice_index = int(batch["slice_index"][0].item())
         full_neighbor = full_neighbor[slice_index]
         full_xy = full_xy[slice_index]
-    visible_spots = batch["visible_spots"][0]
+        if full_expression is not None:
+            full_expression = full_expression[slice_index]
+    visible_spots = batch["visible_spots"][0].to(
+        device=full_neighbor.device, non_blocking=True
+    )
+    target_spots = batch["target_spots"][0].to(
+        device=full_neighbor.device, non_blocking=True
+    )
+    if full_expression is None:
+        visible_expression = batch["visible_expression"]
+        visible_coord = batch["visible_coord"]
+        query_coord = batch["query_coord"]
+        target = batch["target_values"]
+    else:
+        visible_expression = full_expression.index_select(
+            0, visible_spots
+        ).unsqueeze(0)
+        target = full_expression.index_select(0, target_spots).unsqueeze(0)
+        visible_coord = full_xy.index_select(0, visible_spots).unsqueeze(0)
+        query_coord = full_xy.index_select(0, target_spots).unsqueeze(0)
     geometry = build_visible_native_neighbor_graph(
-        full_neighbor, full_xy, visible_spots
+        full_neighbor, full_xy, visible_spots, validate_indices=False
     )
     prediction, auxiliary = model(
-        batch["visible_expression"],
-        batch["visible_coord"],
-        batch["query_coord"],
+        visible_expression,
+        visible_coord,
+        query_coord,
         geometry,
         return_auxiliary=True,
     )
-    target = batch["target_values"]
     mask = torch.ones(
         (*target.shape[:2], 1), dtype=torch.bool, device=target.device
     )
@@ -301,6 +330,7 @@ def run_epoch(
     description="train",
     full_neighbor=None,
     full_xy=None,
+    full_expression=None,
     detailed_metrics=True,
     loss_config=None,
 ):
@@ -343,17 +373,28 @@ def run_epoch(
         "structure_valid_gene_count": 0,
     }
     gradient_context = torch.enable_grad if training else torch.no_grad
+    objective_sum_device = torch.zeros(
+        (), dtype=torch.float64, device=device
+    )
+    last_progress_batch = 0
+    batch_number = 0
     with gradient_context():
         progress = tqdm(loader, desc=description, leave=False)
-        for cpu_batch in progress:
+        for batch_number, cpu_batch in enumerate(progress, start=1):
             batch = move_batch(cpu_batch, device)
             if training:
                 optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 if task == "visium":
-                    prediction, target, mask, baseline = visium_prediction(
-                        model, batch, full_neighbor, full_xy
-                    )
+                    if full_expression is None:
+                        prediction, target, mask, baseline = visium_prediction(
+                            model, batch, full_neighbor, full_xy
+                        )
+                    else:
+                        prediction, target, mask, baseline = visium_prediction(
+                            model, batch, full_neighbor, full_xy,
+                            full_expression=full_expression,
+                        )
                 else:
                     prediction, target, mask, baseline = hd_prediction(model, batch)
                 if loss_mode == "structure_aware":
@@ -384,16 +425,24 @@ def run_epoch(
 
             if loss_mode == "structure_aware" or gene_weight is not None:
                 objective_count = 1
+            elif task == "visium":
+                objective_count = prediction.numel()
             else:
                 expansion = prediction.numel() // mask.numel()
                 objective_count = int(mask.count_nonzero().item()) * expansion
-            totals["objective_sum"] += float(loss.detach()) * objective_count
+            objective_sum_device += loss.detach().double() * objective_count
             totals["objective_count"] += objective_count
-            progress.set_postfix(
-                objective_loss=(
-                    f"{totals['objective_sum'] / max(totals['objective_count'], 1):.4f}"
+            if (
+                detailed_metrics
+                or batch_number == 1
+                or batch_number % _TRAIN_PROGRESS_INTERVAL == 0
+            ):
+                progress.set_postfix(
+                    objective_loss=(
+                        f"{float(objective_sum_device) / max(totals['objective_count'], 1):.4f}"
+                    )
                 )
-            )
+                last_progress_batch = batch_number
 
             if not detailed_metrics:
                 continue
@@ -482,6 +531,15 @@ def run_epoch(
                 totals["structure_valid_gene_count"] += int(
                     loss_terms["valid_genes"].detach()
                 )
+
+        if totals["objective_count"] and last_progress_batch != batch_number:
+            progress.set_postfix(
+                objective_loss=(
+                    f"{float(objective_sum_device) / totals['objective_count']:.4f}"
+                )
+            )
+
+    totals["objective_sum"] = float(objective_sum_device)
 
     if not detailed_metrics:
         return {
@@ -592,7 +650,10 @@ def run_epoch(
 
 
 @torch.no_grad()
-def collect_predictions(task, model, loader, device, use_amp, full_neighbor, full_xy):
+def collect_predictions(
+    task, model, loader, device, use_amp, full_neighbor, full_xy,
+    full_expression=None,
+):
     model.eval()
     collected = {"prediction": [], "truth": [], "baseline": [], "mask": []}
     target_spots = []
@@ -601,9 +662,15 @@ def collect_predictions(task, model, loader, device, use_amp, full_neighbor, ful
         batch = move_batch(cpu_batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             if task == "visium":
-                prediction, target, mask, baseline = visium_prediction(
-                    model, batch, full_neighbor, full_xy
-                )
+                if full_expression is None:
+                    prediction, target, mask, baseline = visium_prediction(
+                        model, batch, full_neighbor, full_xy
+                    )
+                else:
+                    prediction, target, mask, baseline = visium_prediction(
+                        model, batch, full_neighbor, full_xy,
+                        full_expression=full_expression,
+                    )
             else:
                 prediction, target, mask, baseline = hd_prediction(model, batch)
         for key, value in (

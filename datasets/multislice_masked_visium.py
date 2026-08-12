@@ -313,6 +313,7 @@ class _WholeSliceMaskDataset(Dataset):
         target_fraction: float,
         idw_neighbors: int,
         seed: int,
+        materialize_values: bool = True,
     ):
         if role not in self._ROLE_SEED:
             raise ValueError("role must be train, val, or test")
@@ -324,14 +325,16 @@ class _WholeSliceMaskDataset(Dataset):
             raise ValueError("idw_neighbors must be positive")
         if len(data.expression) < 2:
             raise ValueError("a slice needs at least two tissue spots")
-        self.data = data
+        self.materialize_values = materialize_values
+        self.data = data if materialize_values else None
+        self.num_spots = len(data.expression)
         self.role = role
         self.masks_per_slice = masks_per_slice
         self.target_fraction = target_fraction
         self.idw_neighbors = idw_neighbors
         self.seed = seed
         self.epoch = 0
-        self.all_spots = np.arange(len(data.expression), dtype=np.int64)
+        self.all_spots = np.arange(self.num_spots, dtype=np.int64)
 
     def __len__(self):
         return self.masks_per_slice
@@ -362,6 +365,8 @@ class _WholeSliceMaskDataset(Dataset):
         return self.all_spots[~hidden], target_spots
 
     def _baseline(self, visible_spots, target_spots):
+        if self.data is None:
+            raise RuntimeError("baseline materialization is disabled")
         if self.role == "train":
             return np.zeros(
                 (len(target_spots), len(self.data.genes)), dtype=np.float32
@@ -382,7 +387,14 @@ class _WholeSliceMaskDataset(Dataset):
 
     def __getitem__(self, index):
         visible_spots, target_spots = self._partition(index)
-        return {
+        item = {
+            "target_spots": torch.from_numpy(target_spots),
+            "visible_spots": torch.from_numpy(visible_spots),
+        }
+        if not self.materialize_values:
+            return item
+        assert self.data is not None
+        item.update({
             "visible_expression": torch.from_numpy(
                 self.data.expression[visible_spots].astype(np.float32, copy=False)
             ),
@@ -395,12 +407,11 @@ class _WholeSliceMaskDataset(Dataset):
             "target_values": torch.from_numpy(
                 self.data.expression[target_spots].astype(np.float32, copy=False)
             ),
-            "target_spots": torch.from_numpy(target_spots),
-            "visible_spots": torch.from_numpy(visible_spots),
             "baseline": torch.from_numpy(
                 self._baseline(visible_spots, target_spots)
             ),
-        }
+        })
+        return item
 
 
 class MultiSlicePointDataset(Dataset):
@@ -414,6 +425,7 @@ class MultiSlicePointDataset(Dataset):
         mask_target_fraction: float = 0.25,
         idw_neighbors: int = 6,
         seed: int = 2026,
+        materialize_values: bool = True,
     ):
         if role not in {"train", "val", "test"}:
             raise ValueError("role must be train, val, or test")
@@ -435,6 +447,7 @@ class MultiSlicePointDataset(Dataset):
                 target_fraction=mask_target_fraction,
                 idw_neighbors=idw_neighbors,
                 seed=seed + global_index * 100003,
+                materialize_values=materialize_values,
             )
             self.children.append(_TaggedSliceDataset(child, global_index))
             self.global_slice_indices.append(global_index)

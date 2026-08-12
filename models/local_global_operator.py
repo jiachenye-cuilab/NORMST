@@ -27,6 +27,7 @@ class HexGeometry:
     neighbor_index: torch.Tensor
     relative_xy: torch.Tensor
     neighbor_mask: Optional[torch.Tensor] = None
+    indices_validated: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,7 +195,11 @@ class HexNativeLocalOperator(nn.Module):
             ).to(torch.bool) & (index >= 0)
 
         safe_index = index.clamp(min=0)
-        if safe_index.numel() and safe_index.max().item() >= points:
+        if (
+            not geometry.indices_validated
+            and safe_index.numel()
+            and safe_index.max().item() >= points
+        ):
             raise ValueError("native neighbor index is out of bounds")
         if valid_mask is None:
             valid = torch.ones(

@@ -394,6 +394,7 @@ def evaluate_by_slice(
     use_amp,
     full_neighbors,
     full_xy,
+    full_expression,
     workers,
     description,
     loss_config=None,
@@ -413,6 +414,7 @@ def evaluate_by_slice(
             description=f"{description}:{name}",
             full_neighbor=full_neighbors,
             full_xy=full_xy,
+            full_expression=full_expression,
             loss_config=loss_config,
         )
     return _macro_average(per_slice), per_slice
@@ -469,6 +471,7 @@ def save_test_predictions(
     use_amp,
     full_neighbors,
     full_xy,
+    full_expression,
     workers,
 ):
     prediction_dir = output_dir / "test_predictions"
@@ -479,7 +482,7 @@ def save_test_predictions(
         loader = _loader(tagged, device, workers)
         values = collect_predictions(
             "visium", model, loader, device, use_amp,
-            full_neighbors, full_xy,
+            full_neighbors, full_xy, full_expression,
         )
         values["genes"] = prepared.genes
         filename = f"{local_index:03d}_{_safe_name(name)}.npz"
@@ -586,6 +589,7 @@ def main(argv=None):
             mask_target_fraction=args.mask_target_fraction,
             idw_neighbors=args.query_neighbors,
             seed=args.seed,
+            materialize_values=False,
         )
         for role in ("train", "val", "test")
     }
@@ -598,6 +602,12 @@ def main(argv=None):
     ]
     full_xy = [
         torch.from_numpy(item.data.physical_xy).to(device, dtype=torch.float32)
+        for item in prepared.slices
+    ]
+    full_expression = [
+        torch.from_numpy(item.data.expression).to(
+            device, dtype=torch.float32
+        )
         for item in prepared.slices
     ]
     generator = torch.Generator().manual_seed(args.seed)
@@ -648,6 +658,11 @@ def main(argv=None):
         "parameter_breakdown": trainable_parameter_breakdown(model),
         "device_resolved": str(device),
         "amp_enabled": use_amp,
+        "slice_expression_resident_on_device": True,
+        "slice_expression_bytes": sum(
+            value.numel() * value.element_size()
+            for value in full_expression
+        ),
     })
     config["trainable_parameters"] = config["parameter_breakdown"]["total"]
     (args.output_dir / "config.json").write_text(
@@ -688,6 +703,7 @@ def main(argv=None):
             description=f"train {epoch + 1}/{args.epochs}",
             full_neighbor=full_neighbors,
             full_xy=full_xy,
+            full_expression=full_expression,
             detailed_metrics=False,
             loss_config=loss_config,
         )
@@ -695,7 +711,7 @@ def main(argv=None):
         val_started = perf_counter()
         val_macro, val_per_slice = evaluate_by_slice(
             model, datasets["val"], device, use_amp,
-            full_neighbors, full_xy, args.workers,
+            full_neighbors, full_xy, full_expression, args.workers,
             description=f"val {epoch + 1}/{args.epochs}",
             loss_config=loss_config,
         )
@@ -742,7 +758,8 @@ def main(argv=None):
     model.load_state_dict(best["model"])
     test_macro, test_per_slice = evaluate_by_slice(
         model, datasets["test"], device, use_amp,
-        full_neighbors, full_xy, args.workers, description="test",
+        full_neighbors, full_xy, full_expression, args.workers,
+        description="test",
         loss_config=loss_config,
     )
     test_metrics = {
@@ -755,15 +772,27 @@ def main(argv=None):
     )
     save_test_predictions(
         args.output_dir, model, datasets["test"], prepared,
-        device, use_amp, full_neighbors, full_xy, args.workers,
+        device, use_amp, full_neighbors, full_xy, full_expression,
+        args.workers,
     )
     if args.diagnostics:
+        diagnostic_datasets = {
+            role: MultiSlicePointDataset(
+                prepared,
+                role,
+                masks_per_slice=args.masks_per_slice,
+                mask_target_fraction=args.mask_target_fraction,
+                idw_neighbors=args.query_neighbors,
+                seed=args.seed,
+            )
+            for role in args.diagnostic_splits
+        }
         for split in args.diagnostic_splits:
             save_split_diagnostics(
                 args.output_dir,
                 split,
                 model,
-                datasets[split],
+                diagnostic_datasets[split],
                 prepared,
                 device,
                 use_amp,
