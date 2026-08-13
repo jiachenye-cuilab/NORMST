@@ -329,8 +329,9 @@ class PhysicalQueryDecoder(nn.Module):
 class VisiumNORMST(nn.Module):
     """Masked-location reconstruction on compact visible Visium point tokens.
 
-    Initial token content comes only from expression. Coordinates remain
-    separate and are used by native relative-edge geometry and physical query.
+    Initial token content comes only from expression by default.  The opt-in
+    coordinate lifting is reserved for a controlled input-coordinate ablation;
+    coordinates are always used by relative-edge geometry and physical query.
     """
 
     def __init__(
@@ -347,12 +348,23 @@ class VisiumNORMST(nn.Module):
         idw_power: float = 2.0,
         query_chunk_size: int = 1024,
         baseline_calibration: bool = False,
+        residual_head_width_multiplier: int = 2,
+        calibration_only: bool = False,
+        input_coordinate_lifting: bool = False,
     ):
         super().__init__()
-        if min(n_genes, width, num_heads, num_layers) < 1:
+        if min(
+            n_genes, width, num_heads, num_layers,
+            residual_head_width_multiplier,
+        ) < 1:
             raise ValueError("model dimensions must be positive")
+        if calibration_only and not baseline_calibration:
+            raise ValueError(
+                "calibration_only requires baseline_calibration"
+            )
         self.n_genes = n_genes
         self.width = width
+        self.calibration_only = bool(calibration_only)
         self.baseline_calibration_enabled = bool(baseline_calibration)
         self.expression_encoder = ExpressionEncoder(n_genes, width)
         self.blocks = nn.ModuleList([
@@ -375,9 +387,13 @@ class VisiumNORMST(nn.Module):
             query_chunk_size=query_chunk_size,
         )
         self.residual_projection = nn.Sequential(
-            nn.Linear(width + 2, 2 * width),
+            nn.Linear(
+                width + 2, residual_head_width_multiplier * width
+            ),
             nn.GELU(),
-            nn.Linear(2 * width, n_genes),
+            nn.Linear(
+                residual_head_width_multiplier * width, n_genes
+            ),
         )
         self.baseline_calibration = (
             GeneAffine(n_genes) if baseline_calibration else nn.Identity()
@@ -388,6 +404,12 @@ class VisiumNORMST(nn.Module):
             std=1e-3,
         )
         nn.init.zeros_(self.residual_projection[-1].bias)
+        # Instantiate the ablation-only module last and restore the RNG state,
+        # so enabling it changes neither shared initialization nor later data
+        # ordering driven by the global torch generator.
+        if input_coordinate_lifting:
+            with torch.random.fork_rng(devices=[]):
+                self.coordinate_lifting = nn.Linear(2, width, bias=False)
 
     def forward(
         self,
@@ -431,7 +453,15 @@ class VisiumNORMST(nn.Module):
         normalized_visible, normalized_query = _normalize_point_coordinates(
             visible_xy, query_xy, visible_mask
         )
-        tokens = self.expression_encoder(visible_expression)
+        expression_tokens = self.expression_encoder(visible_expression)
+        coordinate_tokens = None
+        if hasattr(self, "coordinate_lifting"):
+            coordinate_tokens = self.coordinate_lifting(
+                normalized_visible.to(expression_tokens.dtype)
+            )
+            tokens = expression_tokens + coordinate_tokens
+        else:
+            tokens = expression_tokens
         tokens = tokens * visible_mask[..., None].to(tokens.dtype)
         initial_tokens = tokens
         for block in self.blocks:
@@ -454,6 +484,8 @@ class VisiumNORMST(nn.Module):
                 normalized_query.to(query_feature.dtype),
             ], dim=-1)
         )
+        if self.calibration_only:
+            residual = residual * 0.0
         query_weight = query_mask[..., None].to(residual.dtype)
         baseline = baseline * query_weight
         prediction = (
@@ -461,12 +493,18 @@ class VisiumNORMST(nn.Module):
         ) * query_weight
         if not return_auxiliary:
             return prediction
-        return prediction, {
+        auxiliary = {
             "baseline": baseline,
             "h0": initial_tokens,
             "hl": tokens,
             "visible_mask": visible_mask,
         }
+        if coordinate_tokens is not None:
+            auxiliary.update({
+                "expression_lifting": expression_tokens,
+                "coordinate_lifting": coordinate_tokens,
+            })
+        return prediction, auxiliary
 
 
 class VisiumHDNORMST(nn.Module):

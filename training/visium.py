@@ -31,6 +31,7 @@ from time import perf_counter
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from datasets.multislice_masked_visium import (
@@ -138,6 +139,30 @@ def parse_args(argv=None):
     parser.add_argument(
         "--baseline-calibration", action="store_true",
         help="enable identity-initialized learned gene-wise IDW scale and bias",
+    )
+    parser.add_argument(
+        "--residual-head-width-multiplier",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help=(
+            "residual MLP hidden width relative to model width; 1 reproduces "
+            "the legacy-width head while 2 preserves the current default"
+        ),
+    )
+    parser.add_argument(
+        "--calibration-only", action="store_true",
+        help=(
+            "train and evaluate only GeneAffine(IDW); requires "
+            "--baseline-calibration and fixes all other parameters"
+        ),
+    )
+    parser.add_argument(
+        "--input-coordinate-lifting", action="store_true",
+        help=(
+            "inject normalized within-slice coordinates into initial tokens; "
+            "disabled by default and intended for the phase-two ablation"
+        ),
     )
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--patience", type=int, default=30)
@@ -298,6 +323,14 @@ def validate_args(args):
         raise ValueError("target_sum must be finite")
     if not np.isfinite(args.alpha_global) or args.alpha_global < 0:
         raise ValueError("alpha_global must be finite and non-negative")
+    if args.calibration_only and not args.baseline_calibration:
+        raise ValueError(
+            "--calibration-only requires --baseline-calibration"
+        )
+    if args.calibration_only and args.input_coordinate_lifting:
+        raise ValueError(
+            "--input-coordinate-lifting has no effect with --calibration-only"
+        )
     if args.width % args.num_heads:
         raise ValueError("width must be divisible by num_heads")
     if not 0.0 < args.mask_target_fraction < 1.0:
@@ -498,6 +531,7 @@ def save_test_predictions(
 def trainable_parameter_breakdown(model):
     groups = {
         "expression_encoder": model.expression_encoder,
+        "coordinate_lifting": getattr(model, "coordinate_lifting", nn.Identity()),
         "operator_blocks": model.blocks,
         "physical_query_decoder": model.query_decoder,
         "residual_decoder": model.residual_projection,
@@ -512,6 +546,15 @@ def trainable_parameter_breakdown(model):
     }
     result["total"] = sum(result.values())
     return result
+
+
+def configure_trainable_parameters(model, calibration_only):
+    if not calibration_only:
+        return
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in model.baseline_calibration.parameters():
+        parameter.requires_grad_(True)
 
 
 def _existing_file(label, candidates):
@@ -542,6 +585,13 @@ def _model_from_config(config, n_genes, device):
         idw_power=float(config.get("idw_power", 2.0)),
         query_chunk_size=int(config.get("query_chunk_size", 1024)),
         baseline_calibration=bool(config.get("baseline_calibration", False)),
+        residual_head_width_multiplier=int(config.get(
+            "residual_head_width_multiplier", 2
+        )),
+        calibration_only=bool(config.get("calibration_only", False)),
+        input_coordinate_lifting=bool(config.get(
+            "input_coordinate_lifting", False
+        )),
     ).to(device)
 
 
@@ -716,9 +766,21 @@ def main(argv=None):
         idw_power=args.idw_power,
         query_chunk_size=args.query_chunk_size,
         baseline_calibration=args.baseline_calibration,
+        residual_head_width_multiplier=args.residual_head_width_multiplier,
+        calibration_only=args.calibration_only,
+        input_coordinate_lifting=args.input_coordinate_lifting,
     ).to(device)
+    configure_trainable_parameters(model, args.calibration_only)
+    optimized_parameters = [
+        parameter for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    if not optimized_parameters:
+        raise ValueError("model has no trainable parameters")
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        optimized_parameters,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs

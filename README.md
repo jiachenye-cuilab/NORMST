@@ -52,6 +52,14 @@ python train.py --task visium \
 `--predict-only` loads `best.pt` by default; use `--checkpoint` to select a
 different checkpoint.
 
+Standard-Visium ablations can use
+`--residual-head-width-multiplier {1,2}` to select the residual MLP hidden
+width. `--baseline-calibration --calibration-only` constructs an
+IDW-plus-GeneAffine control in which only the identity-initialized gene-wise
+scale and bias are trained and the residual correction is fixed to zero.
+`--input-coordinate-lifting` optionally injects normalized within-slice
+coordinates into the initial tokens; it is disabled by default.
+
 ### Paired Visium HD
 
 ```bash
