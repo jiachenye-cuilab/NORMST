@@ -46,11 +46,6 @@ from training.engine import (
     run_epoch,
     seed_everything,
 )
-from training.diagnostics import (
-    DIAGNOSTIC_CHOICES,
-    collect_visium_diagnostic_arrays,
-    write_visium_diagnostics,
-)
 
 
 POSITION_FILES = (
@@ -174,24 +169,6 @@ def parse_args(argv=None):
             "input normalization is unchanged"
         ),
     )
-    parser.add_argument(
-        "--diagnostics",
-        nargs="+",
-        choices=DIAGNOSTIC_CHOICES,
-        default=(),
-        help="optional post-checkpoint slice-wise diagnostic analyses",
-    )
-    parser.add_argument(
-        "--diagnostic-splits",
-        nargs="+",
-        choices=("val", "test"),
-        default=("test",),
-        help="dataset roles analyzed when --diagnostics is enabled",
-    )
-    parser.add_argument(
-        "--pca-components", type=int, default=50,
-        help="requested truth-PCA components; at least 50 are used when available",
-    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda")
@@ -314,7 +291,6 @@ def validate_args(args):
         args.n_genes, args.masks_per_slice,
         args.query_neighbors, args.idw_power, args.query_chunk_size,
         args.width, args.num_heads, args.operator_layers, args.epochs,
-        args.pca_components,
     )
     if min(positive) <= 0:
         raise ValueError("model, preprocessing, and training sizes must be positive")
@@ -519,44 +495,6 @@ def save_test_predictions(
     )
 
 
-@torch.no_grad()
-def save_split_diagnostics(
-    output_dir,
-    split,
-    model,
-    dataset,
-    prepared,
-    device,
-    use_amp,
-    full_neighbors,
-    full_xy,
-    workers,
-    requested,
-    pca_components,
-):
-    per_slice = {}
-    for local_index, name in enumerate(dataset.slice_names):
-        loader = _loader(
-            dataset.tagged_slice_dataset(local_index), device, workers
-        )
-        per_slice[name] = collect_visium_diagnostic_arrays(
-            model,
-            loader,
-            device,
-            use_amp,
-            full_neighbors,
-            full_xy,
-        )
-    return write_visium_diagnostics(
-        output_dir,
-        split,
-        per_slice,
-        prepared.genes,
-        requested,
-        pca_components=pca_components,
-    )
-
-
 def trainable_parameter_breakdown(model):
     groups = {
         "expression_encoder": model.expression_encoder,
@@ -600,9 +538,7 @@ def _model_from_config(config, n_genes, device):
         fusion=config.get("fusion", "add"),
         learnable_alpha=bool(config.get("learnable_alpha", False)),
         alpha_global=float(config.get("alpha_global", 1.0)),
-        query_neighbors=int(config.get(
-            "query_neighbors", config.get("idw_neighbors", 6)
-        )),
+        query_neighbors=int(config.get("query_neighbors", 6)),
         idw_power=float(config.get("idw_power", 2.0)),
         query_chunk_size=int(config.get("query_chunk_size", 1024)),
         baseline_calibration=bool(config.get("baseline_calibration", False)),
@@ -927,32 +863,5 @@ def main(argv=None):
             device, use_amp, full_neighbors, full_xy, full_expression,
             args.workers,
         )
-    if args.diagnostics:
-        diagnostic_datasets = {
-            role: MultiSlicePointDataset(
-                prepared,
-                role,
-                masks_per_slice=args.masks_per_slice,
-                mask_target_fraction=args.mask_target_fraction,
-                idw_neighbors=args.query_neighbors,
-                seed=args.seed,
-            )
-            for role in args.diagnostic_splits
-        }
-        for split in args.diagnostic_splits:
-            save_split_diagnostics(
-                args.output_dir,
-                split,
-                model,
-                diagnostic_datasets[split],
-                prepared,
-                device,
-                use_amp,
-                full_neighbors,
-                full_xy,
-                args.workers,
-                args.diagnostics,
-                args.pca_components,
-            )
     print("Test:", json.dumps(test_metrics))
     return 0
