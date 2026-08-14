@@ -23,6 +23,7 @@ and retains its own physical coordinates and native hex graph.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -54,6 +55,18 @@ POSITION_FILES = (
     "tissue_positions_list.csv",
     "tissue_positions_list.txt",
     "tissue_positions.parquet",
+)
+
+FROZEN_GENE_AFFINE_MATCH_KEYS = (
+    "count_file", "n_genes", "target_sum", "no_rms_scale",
+    "mask_target_fraction", "masks_per_slice", "query_neighbors",
+    "idw_power", "query_chunk_size", "width", "num_heads",
+    "operator_layers", "operator_mode", "fusion", "learnable_alpha",
+    "alpha_global", "input_coordinate_lifting", "learning_rate",
+    "weight_decay", "max_grad_norm", "loss_mode",
+    "gene_correlation_loss_weight", "variance_loss_weight",
+    "negative_loss_weight", "min_structure_target_variance",
+    "loss_gene_weighting", "min_delta", "seed",
 )
 
 
@@ -155,6 +168,14 @@ def parse_args(argv=None):
         help=(
             "train and evaluate only GeneAffine(IDW); requires "
             "--baseline-calibration and fixes all other parameters"
+        ),
+    )
+    parser.add_argument(
+        "--frozen-gene-affine-checkpoint", type=Path, default=None,
+        help=(
+            "load only GeneAffine weight/bias from a matched calibration-only "
+            "checkpoint, freeze them, and zero-initialize the residual output "
+            "layer; requires --baseline-calibration"
         ),
     )
     parser.add_argument(
@@ -331,6 +352,21 @@ def validate_args(args):
         raise ValueError(
             "--input-coordinate-lifting has no effect with --calibration-only"
         )
+    if args.frozen_gene_affine_checkpoint is not None:
+        if args.predict_only:
+            raise ValueError(
+                "--frozen-gene-affine-checkpoint is a training initialization"
+            )
+        if not args.baseline_calibration:
+            raise ValueError(
+                "--frozen-gene-affine-checkpoint requires "
+                "--baseline-calibration"
+            )
+        if args.calibration_only:
+            raise ValueError(
+                "--frozen-gene-affine-checkpoint trains the residual/operator "
+                "and cannot be combined with --calibration-only"
+            )
     if args.width % args.num_heads:
         raise ValueError("width must be divisible by num_heads")
     if not 0.0 < args.mask_target_fraction < 1.0:
@@ -548,13 +584,179 @@ def trainable_parameter_breakdown(model):
     return result
 
 
-def configure_trainable_parameters(model, calibration_only):
-    if not calibration_only:
-        return
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    for parameter in model.baseline_calibration.parameters():
-        parameter.requires_grad_(True)
+def configure_trainable_parameters(
+    model, calibration_only, freeze_baseline_calibration=False,
+):
+    if calibration_only and freeze_baseline_calibration:
+        raise ValueError(
+            "calibration_only and freeze_baseline_calibration are incompatible"
+        )
+    if calibration_only:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.baseline_calibration.parameters():
+            parameter.requires_grad_(True)
+    elif freeze_baseline_calibration:
+        for parameter in model.baseline_calibration.parameters():
+            parameter.requires_grad_(False)
+
+
+def _file_sha256(path: Path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _manifest_contract(path: Path, default_count_file: str):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    contract = {}
+    for role in ("train", "val", "test"):
+        group = payload.get(role)
+        if not group:
+            raise ValueError(f"manifest requires a non-empty {role} group")
+        rows = []
+        if isinstance(group, dict):
+            entries = []
+            for name, value in group.items():
+                if isinstance(value, str):
+                    entries.append({"name": name, "path": value})
+                elif isinstance(value, dict):
+                    entries.append({"name": name, **value})
+                else:
+                    raise ValueError(f"invalid manifest entry for {role}/{name}")
+        elif isinstance(group, list):
+            entries = group
+        else:
+            raise ValueError(f"manifest {role} must be an object or list")
+        for item in entries:
+            name = item.get("name", item.get("id"))
+            data_path = item.get("path")
+            if not name or not data_path:
+                raise ValueError(f"manifest {role} entries require name and path")
+            resolved = Path(data_path)
+            if not resolved.is_absolute():
+                resolved = (path.parent / resolved).resolve()
+            rows.append((
+                str(name), str(resolved),
+                str(item.get("count_file", default_count_file)),
+            ))
+        contract[role] = sorted(rows)
+    return contract
+
+
+def initialize_frozen_gene_affine(
+    model, checkpoint_path, prepared, manifest_path, current_config,
+):
+    """Load matched C1 GeneAffine, freeze it, and zero residual output."""
+    checkpoint_path = Path(checkpoint_path).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    source_dir = checkpoint_path.parent
+    source_config_path = source_dir / "config.json"
+    source_manifest_path = source_dir / "manifest.json"
+    source_genes_path = source_dir / "genes.txt"
+    source_preprocessing_path = source_dir / "preprocessing.npz"
+    for path in (
+        source_config_path, source_manifest_path,
+        source_genes_path, source_preprocessing_path,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"frozen GeneAffine source artifact was not found: {path}"
+            )
+
+    source_config = json.loads(source_config_path.read_text(encoding="utf-8"))
+    if not bool(source_config.get("baseline_calibration", False)) or not bool(
+        source_config.get("calibration_only", False)
+    ):
+        raise ValueError(
+            "frozen GeneAffine source must be a baseline-calibration, "
+            "calibration-only run"
+        )
+    mismatches = {
+        key: {"source": source_config.get(key), "current": current_config.get(key)}
+        for key in FROZEN_GENE_AFFINE_MATCH_KEYS
+        if source_config.get(key) != current_config.get(key)
+    }
+    if mismatches:
+        raise ValueError(
+            "frozen GeneAffine source config differs from the current run: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    source_manifest = _manifest_contract(
+        source_manifest_path, source_config.get(
+            "count_file", "filtered_feature_bc_matrix.h5"
+        )
+    )
+    current_manifest = _manifest_contract(
+        Path(manifest_path), current_config.get(
+            "count_file", "filtered_feature_bc_matrix.h5"
+        )
+    )
+    if source_manifest != current_manifest:
+        raise ValueError(
+            "frozen GeneAffine source and current run use different manifests"
+        )
+
+    source_genes = np.atleast_1d(np.loadtxt(source_genes_path, dtype=str))
+    with np.load(source_preprocessing_path, allow_pickle=True) as values:
+        preprocessing_genes = np.asarray(values["genes"]).astype(str)
+        source_gene_scale = np.asarray(values["gene_scale"], dtype=np.float32)
+    if not np.array_equal(source_genes, preprocessing_genes):
+        raise ValueError(
+            "frozen GeneAffine source genes.txt and preprocessing gene order differ"
+        )
+    if not np.array_equal(source_genes, np.asarray(prepared.genes).astype(str)):
+        raise ValueError(
+            "frozen GeneAffine source and current run use different gene orders"
+        )
+    if not np.array_equal(source_gene_scale, prepared.gene_scale):
+        raise ValueError(
+            "frozen GeneAffine source and current run use different gene scales"
+        )
+
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=True
+    )
+    state = checkpoint.get("model", checkpoint)
+    loaded_keys = (
+        "baseline_calibration.weight", "baseline_calibration.bias",
+    )
+    with torch.no_grad():
+        for key, target in zip(
+            loaded_keys,
+            (model.baseline_calibration.weight, model.baseline_calibration.bias),
+        ):
+            if key not in state or state[key].shape != target.shape:
+                raise ValueError(
+                    f"frozen GeneAffine checkpoint has incompatible {key}"
+                )
+            target.copy_(state[key].to(device=target.device, dtype=target.dtype))
+        output_layer = model.residual_projection[-1]
+        if not isinstance(output_layer, nn.Linear):
+            raise TypeError("residual output layer must be linear")
+        output_layer.weight.zero_()
+        output_layer.bias.zero_()
+    configure_trainable_parameters(
+        model, calibration_only=False, freeze_baseline_calibration=True,
+    )
+    return {
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": _file_sha256(checkpoint_path),
+        "source_config": str(source_config_path.resolve()),
+        "source_manifest": str(source_manifest_path.resolve()),
+        "source_best_epoch": checkpoint.get("epoch"),
+        "loaded_keys": list(loaded_keys),
+        "frozen_parameter_names": list(loaded_keys),
+        "manifest_equal": True,
+        "genes_equal": True,
+        "gene_scale_equal": True,
+        "matched_config_keys": list(FROZEN_GENE_AFFINE_MATCH_KEYS),
+        "residual_output_layer_zero_initialized": True,
+        "epoch0_prediction_contract": "frozen_C1_GeneAffine(IDW)",
+    }
 
 
 def _existing_file(label, candidates):
@@ -770,7 +972,17 @@ def main(argv=None):
         calibration_only=args.calibration_only,
         input_coordinate_lifting=args.input_coordinate_lifting,
     ).to(device)
-    configure_trainable_parameters(model, args.calibration_only)
+    frozen_gene_affine = None
+    if args.frozen_gene_affine_checkpoint is not None:
+        frozen_gene_affine = initialize_frozen_gene_affine(
+            model,
+            args.frozen_gene_affine_checkpoint,
+            prepared,
+            manifest_path,
+            vars(args),
+        )
+    else:
+        configure_trainable_parameters(model, args.calibration_only)
     optimized_parameters = [
         parameter for parameter in model.parameters()
         if parameter.requires_grad
@@ -788,7 +1000,10 @@ def main(argv=None):
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     config = vars(args).copy()
-    for key in ("output_dir", "visium_root", "manifest", "checkpoint"):
+    for key in (
+        "output_dir", "visium_root", "manifest", "checkpoint",
+        "frozen_gene_affine_checkpoint",
+    ):
         if config[key] is not None:
             config[key] = str(config[key])
     config.update({
@@ -812,6 +1027,11 @@ def main(argv=None):
             value.numel() * value.element_size()
             for value in full_expression
         ),
+        "baseline_calibration_frozen": frozen_gene_affine is not None,
+        "residual_output_layer_zero_initialized": (
+            frozen_gene_affine is not None
+        ),
+        "frozen_gene_affine_source": frozen_gene_affine,
     })
     config["trainable_parameters"] = config["parameter_breakdown"]["total"]
     (args.output_dir / "config.json").write_text(
