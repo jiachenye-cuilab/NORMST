@@ -15,12 +15,37 @@ class LossConfig:
     thinning_probability: float = 0.5
     nb_weight: float = 0.1
     consistency_weight: float = 0.05
+    latent_variance_weight: float = 0.0
+    latent_covariance_weight: float = 0.0
 
     def __post_init__(self):
         if not 0 < self.thinning_probability < 1:
             raise ValueError("thinning_probability must be in (0, 1)")
-        if self.nb_weight < 0 or self.consistency_weight < 0:
+        if (
+            self.nb_weight < 0
+            or self.consistency_weight < 0
+            or self.latent_variance_weight < 0
+            or self.latent_covariance_weight < 0
+        ):
             raise ValueError("loss weights must be non-negative")
+
+
+def latent_variance_covariance(
+    latent: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """VICReg-style scale floor and correlation penalty across spots."""
+    if latent.ndim != 2 or latent.shape[1] < 2:
+        raise ValueError("latent must be a [spots, dimensions] matrix")
+    values = latent.float()
+    centered = values - values.mean(dim=0, keepdim=True)
+    variance = centered.square().mean(dim=0)
+    standard_deviation = torch.sqrt(variance + 1e-4)
+    variance_penalty = F.relu(1.0 - standard_deviation).mean()
+    normalized = centered / standard_deviation.clamp_min(1e-4)
+    correlation = normalized.T @ normalized / max(values.shape[0], 1)
+    off_diagonal = correlation - torch.diag_embed(torch.diagonal(correlation))
+    covariance_penalty = off_diagonal.square().sum() / values.shape[1]
+    return variance_penalty, covariance_penalty
 
 
 def binomial_thinning(
@@ -133,16 +158,24 @@ def denoising_objective(
     else:
         consistency = latent_first.sum() * 0.0
 
+    variance, covariance = latent_variance_covariance(
+        torch.cat([latent_first, latent_second], dim=0)
+    )
+
     total = (
         cross_entropy
         + config.nb_weight * nb
         + config.consistency_weight * consistency
+        + config.latent_variance_weight * variance
+        + config.latent_covariance_weight * covariance
     )
     return {
         "total_loss": total,
         "composition_cross_entropy": cross_entropy,
         "negative_binomial_nll": nb,
         "latent_consistency": consistency,
+        "latent_variance": variance,
+        "latent_covariance": covariance,
         "valid_directions": valid_ab.sum() + valid_ba.sum(),
         "valid_pairs": valid_pair.sum(),
     }

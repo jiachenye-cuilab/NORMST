@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from checkpoint_io import load_checkpoint
 from data import (
     SpotCountDataset,
     assert_output_outside_sources,
@@ -112,7 +113,11 @@ def main(argv=None):
 
     checkpoint_path = args.checkpoint.resolve()
     manifest_path = args.manifest.resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = load_checkpoint(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
     model_config = ModelConfig.from_dict(checkpoint["model_config"])
     genes = np.asarray(checkpoint["genes"], dtype=str)
     if genes.shape != (model_config.n_genes,):

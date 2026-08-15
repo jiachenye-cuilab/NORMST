@@ -9,6 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from checkpoint_io import load_checkpoint
 from losses import composition_cross_entropy, negative_binomial_nll
 from model import CountAwareAutoencoder, ModelConfig
 
@@ -63,8 +64,10 @@ class FrozenCountRepresentation(nn.Module):
         checkpoint_path: str | Path,
         map_location: str | torch.device = "cpu",
     ) -> "FrozenCountRepresentation":
-        checkpoint = torch.load(
-            Path(checkpoint_path), map_location=map_location, weights_only=False
+        checkpoint = load_checkpoint(
+            checkpoint_path,
+            map_location=map_location,
+            weights_only=False,
         )
         if "latent_statistics" not in checkpoint:
             raise ValueError("completed best.pt with latent_statistics is required")

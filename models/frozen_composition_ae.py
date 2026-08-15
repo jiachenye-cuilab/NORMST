@@ -15,6 +15,10 @@ import torch.nn.functional as F
 
 _PRETRAIN_MODEL_PATH = Path(__file__).resolve().parents[1] / "pre-train" / "model.py"
 _PRETRAIN_MODULE_NAME = "_normst_frozen_pretrain_model"
+_PRETRAIN_CHECKPOINT_IO_PATH = (
+    Path(__file__).resolve().parents[1] / "pre-train" / "checkpoint_io.py"
+)
+_PRETRAIN_CHECKPOINT_IO_MODULE_NAME = "_normst_frozen_pretrain_checkpoint_io"
 
 
 def _pretrain_classes():
@@ -29,6 +33,26 @@ def _pretrain_classes():
         sys.modules[_PRETRAIN_MODULE_NAME] = module
         spec.loader.exec_module(module)
     return module.CountAwareAutoencoder, module.ModelConfig
+
+
+def _load_pretrain_checkpoint(path: Path, map_location):
+    module = sys.modules.get(_PRETRAIN_CHECKPOINT_IO_MODULE_NAME)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            _PRETRAIN_CHECKPOINT_IO_MODULE_NAME, _PRETRAIN_CHECKPOINT_IO_PATH
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"cannot load checkpoint I/O from {_PRETRAIN_CHECKPOINT_IO_PATH}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_PRETRAIN_CHECKPOINT_IO_MODULE_NAME] = module
+        spec.loader.exec_module(module)
+    return module.load_checkpoint(
+        path,
+        map_location=map_location,
+        weights_only=False,
+    )
 
 
 def sha256_file(path: str | Path) -> str:
@@ -90,7 +114,7 @@ class FrozenCompositionAE(nn.Module):
         map_location: str | torch.device = "cpu",
     ) -> "FrozenCompositionAE":
         path = Path(checkpoint_path).resolve()
-        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        checkpoint = _load_pretrain_checkpoint(path, map_location)
         CountAwareAutoencoder, ModelConfig = _pretrain_classes()
         model = CountAwareAutoencoder(
             ModelConfig.from_dict(checkpoint["model_config"])
