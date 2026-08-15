@@ -58,7 +58,7 @@ POSITION_FILES = (
 )
 
 FROZEN_GENE_AFFINE_MATCH_KEYS = (
-    "count_file", "n_genes", "target_sum", "no_rms_scale",
+    "count_file", "n_genes", "fixed_genes_sha256", "target_sum", "no_rms_scale",
     "mask_target_fraction", "masks_per_slice", "query_neighbors",
     "idw_power", "query_chunk_size", "width", "num_heads",
     "operator_layers", "operator_mode", "fusion", "learnable_alpha",
@@ -99,6 +99,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
     parser.add_argument("--n-genes", type=int, default=1000)
+    parser.add_argument(
+        "--fixed-genes", type=Path, default=None,
+        help=(
+            "optional genes.txt whose exact non-empty unique order is reused; "
+            "its length must equal --n-genes"
+        ),
+    )
     parser.add_argument(
         "--target-sum", type=float, default=1e4,
         help=(
@@ -321,6 +328,27 @@ def resolve_run_manifest(args):
     return output_manifest
 
 
+def _load_fixed_genes(path: Path, n_genes: int) -> np.ndarray:
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"fixed genes file was not found: {path}")
+    genes = np.asarray([
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ], dtype=str)
+    if genes.size < 1:
+        raise ValueError("fixed genes file must contain at least one gene")
+    if len(np.unique(genes)) != len(genes):
+        raise ValueError("fixed genes file must not contain duplicate genes")
+    if len(genes) != n_genes:
+        raise ValueError(
+            f"--fixed-genes contains {len(genes)} genes but --n-genes is "
+            f"{n_genes}"
+        )
+    return genes
+
+
 def validate_args(args):
     if not args.predict_only and args.visium_root is None and args.manifest is None:
         raise ValueError("training requires --visium-root or --manifest")
@@ -342,6 +370,13 @@ def validate_args(args):
         raise ValueError("model, preprocessing, and training sizes must be positive")
     if not np.isfinite(args.target_sum):
         raise ValueError("target_sum must be finite")
+    if args.fixed_genes is not None:
+        if args.predict_only:
+            raise ValueError(
+                "--fixed-genes is a training input; --predict-only uses the "
+                "saved genes.txt and preprocessing.npz"
+            )
+        _load_fixed_genes(args.fixed_genes, args.n_genes)
     if not np.isfinite(args.alpha_global) or args.alpha_global < 0:
         raise ValueError("alpha_global must be finite and non-negative")
     if args.calibration_only and not args.baseline_calibration:
@@ -607,6 +642,11 @@ def _file_sha256(path: Path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _genes_sha256(genes: np.ndarray):
+    normalized = "\n".join(np.asarray(genes).astype(str).tolist()) + "\n"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _manifest_contract(path: Path, default_count_file: str):
@@ -903,6 +943,14 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = resolve_run_manifest(args)
 
+    fixed_genes = None
+    fixed_genes_path = None
+    fixed_genes_sha256 = None
+    if args.fixed_genes is not None:
+        fixed_genes_path = args.fixed_genes.resolve()
+        fixed_genes = _load_fixed_genes(fixed_genes_path, args.n_genes)
+        fixed_genes_sha256 = _genes_sha256(fixed_genes)
+
     print("Preparing leakage-safe multi-slice Visium data ...")
     prepared = prepare_multislice_visium(
         manifest_path=str(manifest_path),
@@ -911,6 +959,7 @@ def main(argv=None):
         target_sum=args.target_sum,
         seed=args.seed,
         apply_rms_scale=not args.no_rms_scale,
+        fixed_genes=fixed_genes,
     )
     training_gene_std, loss_gene_weight = fit_training_gene_weights(
         prepared, args.loss_gene_weighting
@@ -974,12 +1023,14 @@ def main(argv=None):
     ).to(device)
     frozen_gene_affine = None
     if args.frozen_gene_affine_checkpoint is not None:
+        initialization_config = vars(args).copy()
+        initialization_config["fixed_genes_sha256"] = fixed_genes_sha256
         frozen_gene_affine = initialize_frozen_gene_affine(
             model,
             args.frozen_gene_affine_checkpoint,
             prepared,
             manifest_path,
-            vars(args),
+            initialization_config,
         )
     else:
         configure_trainable_parameters(model, args.calibration_only)
@@ -1002,7 +1053,7 @@ def main(argv=None):
     config = vars(args).copy()
     for key in (
         "output_dir", "visium_root", "manifest", "checkpoint",
-        "frozen_gene_affine_checkpoint",
+        "fixed_genes", "frozen_gene_affine_checkpoint",
     ):
         if config[key] is not None:
             config[key] = str(config[key])
@@ -1015,6 +1066,12 @@ def main(argv=None):
         "resolved_manifest": str(manifest_path.resolve()),
         "batch_size": 1,
         "n_selected_genes": len(prepared.genes),
+        "gene_selection": (
+            "fixed_genes_exact_order"
+            if fixed_genes is not None
+            else "training_only_seurat_v3_paper_hvg"
+        ),
+        "fixed_genes_sha256": fixed_genes_sha256,
         "num_layers": args.operator_layers,
         "train_slices": datasets["train"].slice_names,
         "val_slices": datasets["val"].slice_names,
@@ -1033,6 +1090,8 @@ def main(argv=None):
         ),
         "frozen_gene_affine_source": frozen_gene_affine,
     })
+    if fixed_genes_path is not None:
+        config["fixed_genes"] = str(fixed_genes_path)
     config["trainable_parameters"] = config["parameter_breakdown"]["total"]
     (args.output_dir / "config.json").write_text(
         json.dumps(config, indent=2), encoding="utf-8"

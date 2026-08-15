@@ -38,6 +38,12 @@ library-size normalization before `log1p`; use `--target-sum -1` or `0` for
 records pooled loss only; validation and test retain complete per-slice and
 equal-slice macro metrics.
 
+Use `--fixed-genes <genes.txt>` to reuse an exact non-empty, unique gene order;
+the file length must equal `--n-genes`. CP10K/log1p and RMS are still fitted
+from the assigned training slices. The saved config records the resolved source
+and normalized gene SHA-256. A frozen-GeneAffine F1 run and its calibration-only
+C1 source must use the same fixed genes, manifest, seed, and matched settings.
+
 Test prediction arrays are not saved after training by default. Add
 `--save-predictions` to export them immediately. A downloaded run can recreate
 the same test predictions later by loading its saved model and preprocessing
