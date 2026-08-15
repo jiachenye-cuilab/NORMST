@@ -19,6 +19,7 @@ class ModelConfig:
     composition_scale: float = 1e4
     dropout: float = 0.1
     dispersion_init: float = 10.0
+    decoder_type: str = "nonlinear"
 
     @property
     def feature_dim(self) -> int:
@@ -39,6 +40,7 @@ class ModelConfig:
             "composition_scale",
             "dropout",
             "dispersion_init",
+            "decoder_type",
         }
         values = {key: value for key, value in payload.items() if key in accepted}
         values["hidden_dims"] = tuple(values["hidden_dims"])
@@ -58,6 +60,8 @@ def _validate_config(config: ModelConfig) -> None:
         raise ValueError("dropout must be in [0, 1)")
     if config.dispersion_init <= 0:
         raise ValueError("dispersion_init must be positive")
+    if config.decoder_type not in {"nonlinear", "linear"}:
+        raise ValueError("decoder_type must be nonlinear or linear")
 
 
 def _hidden_block(input_dim: int, output_dim: int, dropout: float):
@@ -92,9 +96,10 @@ class CountAwareAutoencoder(nn.Module):
 
         decoder_layers: list[nn.Module] = []
         previous = config.composition_dim
-        for width in reversed(config.hidden_dims):
-            decoder_layers.extend(_hidden_block(previous, width, config.dropout))
-            previous = width
+        if config.decoder_type == "nonlinear":
+            for width in reversed(config.hidden_dims):
+                decoder_layers.extend(_hidden_block(previous, width, config.dropout))
+                previous = width
         decoder_layers.append(nn.Linear(previous, config.n_genes))
         self.decoder = nn.Sequential(*decoder_layers)
 

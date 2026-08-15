@@ -7,11 +7,12 @@ NORMST: a neural operator for resolution magnification in spatial transcriptomic
 
 ## Geometry-adaptive local-global models
 
-The unified implementation supports standard Visium masked-spot recovery and
-official paired Visium HD 16-to-8 micrometre prediction. Standard Visium uses
-compact visible point tokens and the native six-neighbour topology; Visium HD
-uses the original Cartesian bin grid. Both routes combine a local operator,
-Galerkin global operator and interpolation residual baseline.
+The unified implementation supports standard Visium masked-spot recovery,
+frozen-AE composition recovery, and official paired Visium HD 16-to-8
+micrometre prediction. Standard Visium and AE-NORMST use compact visible point
+tokens and the native six-neighbour topology; Visium HD uses the original
+Cartesian bin grid. All routes combine a local operator, Galerkin global
+operator and interpolation residual baseline.
 
 ### Standard Visium
 
@@ -59,6 +60,33 @@ IDW-plus-GeneAffine control in which only the identity-initialized gene-wise
 scale and bias are trained and the residual correction is fixed to zero.
 `--input-coordinate-lifting` optionally injects normalized within-slice
 coordinates into the initial tokens; it is disabled by default.
+
+### AE-NORMST
+
+AE-NORMST is an additive task and does not change either existing model. It
+loads a completed count-aware AE, freezes all AE weights, and predicts only its
+standardized composition latent. The hidden spot's library size never enters
+the forward pass, IDW baseline, or loss. The frozen decoder is used only for a
+composition auxiliary loss and evaluation; its parameters remain frozen while
+gradients can pass back to the NORMST latent prediction.
+
+```bash
+python train.py --task ae_visium \
+  --manifest pre-train/manifests/random_pair_8_2_2_seed2027.json \
+  --ae-checkpoint /path/to/frozen-ae/best.pt \
+  --output-dir save/ae_normst/composition_only_seed2027 \
+  --library-context zero \
+  --seed 2027
+```
+
+For the matched visible-library condition, change only
+`--library-context zero` to `--library-context visible`. Both modes instantiate
+the same library-lifting layer and therefore have identical model shapes and
+parameter counts. The visible condition supplies train-standardized
+`log1p(full-gene total UMI)` for visible spots only. Training writes latent and
+decoded-composition metrics per slice and as equal-slice macro averages, along
+with a latent-IDW baseline. Use `--predict-only` on a completed run to export
+compact 32-dimensional test predictions.
 
 ### Paired Visium HD
 

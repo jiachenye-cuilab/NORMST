@@ -1,0 +1,49 @@
+{
+  "_meta": {
+    "protocol": "pair_grouped_random_split",
+    "split_seed": 2027,
+    "split_unit": "serial_pair",
+    "ratio_slices": "8:2:2",
+    "description": "A single matched-model benchmark split. Six complete serial pairs were permuted with numpy.default_rng(2027); the first four pairs are train, the fifth is validation, and the sixth is test.",
+    "pair_permutation": [
+      "Br5595_anterior",
+      "Br8100_posterior",
+      "Br5595_posterior",
+      "Br5292_posterior",
+      "Br5292_anterior",
+      "Br8100_anterior"
+    ],
+    "slice_metadata": {
+      "151507": {"donor": "Br5292", "pair": "Br5292_anterior", "position": "anterior", "serial": "a"},
+      "151508": {"donor": "Br5292", "pair": "Br5292_anterior", "position": "anterior", "serial": "b"},
+      "151509": {"donor": "Br5292", "pair": "Br5292_posterior", "position": "posterior", "serial": "a"},
+      "151510": {"donor": "Br5292", "pair": "Br5292_posterior", "position": "posterior", "serial": "b"},
+      "151669": {"donor": "Br5595", "pair": "Br5595_anterior", "position": "anterior", "serial": "a"},
+      "151670": {"donor": "Br5595", "pair": "Br5595_anterior", "position": "anterior", "serial": "b"},
+      "151671": {"donor": "Br5595", "pair": "Br5595_posterior", "position": "posterior", "serial": "a"},
+      "151672": {"donor": "Br5595", "pair": "Br5595_posterior", "position": "posterior", "serial": "b"},
+      "151673": {"donor": "Br8100", "pair": "Br8100_anterior", "position": "anterior", "serial": "a"},
+      "151674": {"donor": "Br8100", "pair": "Br8100_anterior", "position": "anterior", "serial": "b"},
+      "151675": {"donor": "Br8100", "pair": "Br8100_posterior", "position": "posterior", "serial": "a"},
+      "151676": {"donor": "Br8100", "pair": "Br8100_posterior", "position": "posterior", "serial": "b"}
+    }
+  },
+  "train": {
+    "151669": {"path": "../../../Data/visium/151669", "donor": "Br5595", "pair": "Br5595_anterior", "position": "anterior", "serial": "a"},
+    "151670": {"path": "../../../Data/visium/151670", "donor": "Br5595", "pair": "Br5595_anterior", "position": "anterior", "serial": "b"},
+    "151675": {"path": "../../../Data/visium/151675", "donor": "Br8100", "pair": "Br8100_posterior", "position": "posterior", "serial": "a"},
+    "151676": {"path": "../../../Data/visium/151676", "donor": "Br8100", "pair": "Br8100_posterior", "position": "posterior", "serial": "b"},
+    "151671": {"path": "../../../Data/visium/151671", "donor": "Br5595", "pair": "Br5595_posterior", "position": "posterior", "serial": "a"},
+    "151672": {"path": "../../../Data/visium/151672", "donor": "Br5595", "pair": "Br5595_posterior", "position": "posterior", "serial": "b"},
+    "151509": {"path": "../../../Data/visium/151509", "donor": "Br5292", "pair": "Br5292_posterior", "position": "posterior", "serial": "a"},
+    "151510": {"path": "../../../Data/visium/151510", "donor": "Br5292", "pair": "Br5292_posterior", "position": "posterior", "serial": "b"}
+  },
+  "val": {
+    "151507": {"path": "../../../Data/visium/151507", "donor": "Br5292", "pair": "Br5292_anterior", "position": "anterior", "serial": "a"},
+    "151508": {"path": "../../../Data/visium/151508", "donor": "Br5292", "pair": "Br5292_anterior", "position": "anterior", "serial": "b"}
+  },
+  "test": {
+    "151673": {"path": "../../../Data/visium/151673", "donor": "Br8100", "pair": "Br8100_anterior", "position": "anterior", "serial": "a"},
+    "151674": {"path": "../../../Data/visium/151674", "donor": "Br8100", "pair": "Br8100_anterior", "position": "anterior", "serial": "b"}
+  }
+}
