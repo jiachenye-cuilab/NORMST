@@ -190,11 +190,16 @@ def assert_output_outside_sources(
     protected_roots = {item.path.resolve() for item in entries}
     protected_roots.update(item.path.resolve().parent for item in entries)
     for item in entries:
-        protected_roots.update(
-            parent
-            for parent in item.path.resolve().parents
-            if parent.name.casefold() == "data"
+        data_root = next(
+            (
+                parent
+                for parent in item.path.resolve().parents
+                if parent.name.casefold() == "data"
+            ),
+            None,
         )
+        if data_root is not None:
+            protected_roots.add(data_root)
     for protected in protected_roots:
         try:
             output.relative_to(protected)
