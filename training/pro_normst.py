@@ -56,7 +56,6 @@ DEFAULT_PANEL = (
     / "dlpfc_151676_shared_panel_20260817"
     / "shared_panel_512_ensembl.txt"
 )
-CONTRACT_PATH = SOURCE_ROOT / "Pro_contract.md"
 # Bump whenever executable model/data/mask/loss/optimizer semantics change.
 NUMERICAL_IMPLEMENTATION_SCHEMA = "pro-normst-numerical-v1"
 TEST_ARTIFACTS_DIRECTORY = "test_artifacts"
@@ -167,12 +166,6 @@ def _device_from_argument(value: str) -> torch.device:
     if device.type not in {"cpu", "cuda"}:
         raise ValueError("ProNORMST supports only CPU or CUDA devices")
     return device
-
-
-def _optional_file_sha256(path: Path) -> str | None:
-    """Hash an optional audit document without making it a runtime dependency."""
-
-    return file_sha256(path) if path.is_file() else None
 
 
 def _split_identity(data: ProNORMSTData) -> tuple[str, str]:
@@ -429,7 +422,6 @@ def _contract_manifest(
     return {
         "schema": "pro-normst-training-contract-v2",
         "numerical_implementation_schema": NUMERICAL_IMPLEMENTATION_SCHEMA,
-        "pro_contract_sha256": _optional_file_sha256(CONTRACT_PATH),
         "implementation_sha256": {
             str(path.relative_to(SOURCE_ROOT)).replace("\\", "/"): file_sha256(path)
             for path in (
@@ -503,7 +495,6 @@ def _audit_provenance(contract_manifest: dict[str, Any]) -> dict[str, Any]:
     """Return recorded provenance that must not decide resume compatibility."""
 
     return {
-        "pro_contract_sha256": contract_manifest.get("pro_contract_sha256"),
         "implementation_sha256": contract_manifest.get("implementation_sha256"),
         "runtime": contract_manifest.get("runtime"),
         "candidate_lock_sha256": contract_manifest.get("run", {}).get(
