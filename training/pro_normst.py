@@ -169,6 +169,12 @@ def _device_from_argument(value: str) -> torch.device:
     return device
 
 
+def _optional_file_sha256(path: Path) -> str | None:
+    """Hash an optional audit document without making it a runtime dependency."""
+
+    return file_sha256(path) if path.is_file() else None
+
+
 def _split_identity(data: ProNORMSTData) -> tuple[str, str]:
     protocol = str(data.split_metadata.get("protocol", ""))
     if protocol == "pair_grouped_lodo":
@@ -423,7 +429,7 @@ def _contract_manifest(
     return {
         "schema": "pro-normst-training-contract-v2",
         "numerical_implementation_schema": NUMERICAL_IMPLEMENTATION_SCHEMA,
-        "pro_contract_sha256": file_sha256(CONTRACT_PATH),
+        "pro_contract_sha256": _optional_file_sha256(CONTRACT_PATH),
         "implementation_sha256": {
             str(path.relative_to(SOURCE_ROOT)).replace("\\", "/"): file_sha256(path)
             for path in (
