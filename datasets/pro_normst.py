@@ -130,12 +130,11 @@ class ProNORMSTPreprocessing:
     detection_rate: np.ndarray
     positive_weight: np.ndarray
     gene_mean_z: np.ndarray
-    manifest_sha256: str
     panel_sha256: str
 
     def manifest(self) -> dict[str, Any]:
         return {
-            "schema": "pro-normst-preprocessing-v1",
+            "schema": "pro-normst-preprocessing-v2",
             "panel_size": len(self.gene_ids),
             "panel_ordered_sha256": self.panel_sha256,
             "gene_scale_sha256": _array_sha256(self.gene_scale.astype("<f4")),
@@ -146,7 +145,6 @@ class ProNORMSTPreprocessing:
                 self.positive_weight.astype("<f4")
             ),
             "gene_mean_z_sha256": _array_sha256(self.gene_mean_z.astype("<f4")),
-            "manifest_sha256": self.manifest_sha256,
             "transform": "log1p(panel_only_cp10k)",
             "scale": "train_slice_balanced_uncentered_rms",
         }
@@ -174,11 +172,6 @@ def load_panel(path: str | Path) -> tuple[str, ...]:
             f"Shared panel ordered hash mismatch: {actual_hash} != {PANEL_ORDERED_SHA256}"
         )
     return values
-
-
-def _canonical_json_hash(payload: Any) -> str:
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _validate_frozen_split(
@@ -228,7 +221,7 @@ def _validate_frozen_split(
 def load_split_manifest(
     path: str | Path,
     default_count_file: str = "filtered_feature_bc_matrix.h5",
-) -> tuple[dict[str, list[SliceSpec]], dict[str, Any], str]:
+) -> tuple[dict[str, list[SliceSpec]], dict[str, Any]]:
     manifest_path = Path(path).resolve()
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     metadata = payload.get("_meta", {})
@@ -291,7 +284,7 @@ def load_split_manifest(
         if any(spec.donor != held_out for spec in roles["test"]):
             raise ValueError("LODO test role contains a non-held-out donor")
     _validate_frozen_split(roles, metadata)
-    return roles, metadata, _canonical_json_hash(payload)
+    return roles, metadata
 
 
 def _read_positions(directory: Path) -> pd.DataFrame:
@@ -476,7 +469,7 @@ def prepare_pro_normst_data(
 ) -> ProNORMSTData:
     """Load all roles, fitting every learned statistic on train slices only."""
     panel = load_panel(panel_path)
-    specs, metadata, manifest_hash = load_split_manifest(manifest_path, count_file)
+    specs, metadata = load_split_manifest(manifest_path, count_file)
     roles = {
         role: [_read_slice(spec, panel) for spec in specs[role]]
         for role in ("train", "val", "test")
@@ -517,7 +510,6 @@ def prepare_pro_normst_data(
         detection_rate=detection_rate.astype(np.float32),
         positive_weight=positive_weight.astype(np.float32),
         gene_mean_z=gene_mean_z,
-        manifest_sha256=manifest_hash,
         panel_sha256=PANEL_ORDERED_SHA256,
     )
     return ProNORMSTData(roles=roles, preprocessing=preprocessing, split_metadata=metadata)

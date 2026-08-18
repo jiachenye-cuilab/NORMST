@@ -420,21 +420,8 @@ def _contract_manifest(
         for role, role_banks in banks.items()
     }
     return {
-        "schema": "pro-normst-training-contract-v2",
+        "schema": "pro-normst-training-contract-v3",
         "numerical_implementation_schema": NUMERICAL_IMPLEMENTATION_SCHEMA,
-        "implementation_sha256": {
-            str(path.relative_to(SOURCE_ROOT)).replace("\\", "/"): file_sha256(path)
-            for path in (
-                SOURCE_ROOT / "train.py",
-                SOURCE_ROOT / "models" / "pro_normst.py",
-                SOURCE_ROOT / "models" / "progressive_normst.py",
-                SOURCE_ROOT / "datasets" / "pro_normst.py",
-                SOURCE_ROOT / "training" / "pro_normst_masks.py",
-                SOURCE_ROOT / "training" / "pro_normst_engine.py",
-                SOURCE_ROOT / "training" / "pro_normst.py",
-                SOURCE_ROOT / "training" / "pro_normst_acceptance.py",
-            )
-        },
         "model": model.contract_manifest(),
         "preprocessing": data.preprocessing.manifest(),
         "mask_schema": MASK_SCHEMA,
@@ -495,7 +482,6 @@ def _audit_provenance(contract_manifest: dict[str, Any]) -> dict[str, Any]:
     """Return recorded provenance that must not decide resume compatibility."""
 
     return {
-        "implementation_sha256": contract_manifest.get("implementation_sha256"),
         "runtime": contract_manifest.get("runtime"),
         "candidate_lock_sha256": contract_manifest.get("run", {}).get(
             "candidate_lock_sha256"
@@ -526,18 +512,6 @@ def _comparison_contract(contract_manifest: dict[str, Any]) -> dict[str, Any]:
         "optimization": contract_manifest["optimization"],
         "precision": contract_manifest["run"]["precision"],
     }
-
-
-def _candidate_lock_artifact_hashes(output_dir: Path) -> dict[str, str]:
-    names = (
-        "contract_manifest.json",
-        "split_manifest.snapshot.json",
-        "best.pt",
-    )
-    missing = [name for name in names if not (output_dir / name).is_file()]
-    if missing:
-        raise FileNotFoundError(f"pilot run is missing required artifacts: {missing}")
-    return {name: file_sha256(output_dir / name) for name in names}
 
 
 def _compact_bptt_gate(gate: dict[str, Any]) -> dict[str, Any]:
@@ -687,9 +661,13 @@ def _write_candidate_lock(
             "pilot artifacts do not satisfy the candidate-lock contract"
         ) from error
     signature = _comparison_contract(contract_manifest)
-    artifact_hashes = _candidate_lock_artifact_hashes(output_dir)
+    checkpoint_path = output_dir / "best.pt"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"pilot run is missing required checkpoint: {checkpoint_path.name}"
+        )
     payload = {
-        "schema": "pro-normst-candidate-lock-v2",
+        "schema": "pro-normst-candidate-lock-v3",
         "status": "locked",
         "candidate_signature": signature,
         "candidate_signature_sha256": canonical_sha256(signature),
@@ -701,7 +679,7 @@ def _write_candidate_lock(
             "smoke": bool(config.get("smoke")),
         },
         "gates": gates,
-        "artifact_sha256": artifact_hashes,
+        "checkpoint_sha256": file_sha256(checkpoint_path),
     }
     path = output_dir / "candidate_lock.json"
     _write_json(path, payload, allow_replace=False)
@@ -714,7 +692,7 @@ def _validate_candidate_lock(
 ) -> dict[str, Any]:
     lock_path = path.resolve()
     payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    if payload.get("schema") != "pro-normst-candidate-lock-v2":
+    if payload.get("schema") != "pro-normst-candidate-lock-v3":
         raise ValueError("candidate lock schema is incompatible")
     if payload.get("status") != "locked":
         raise ValueError("candidate lock is not locked")
@@ -733,16 +711,8 @@ def _validate_candidate_lock(
     }
     if identity != expected_identity:
         raise ValueError("candidate lock pilot identity is invalid")
-    artifact_hashes = payload.get("artifact_sha256", {})
-    required_artifacts = {
-        "best.pt",
-        "contract_manifest.json",
-        "split_manifest.snapshot.json",
-    }
-    if set(artifact_hashes) != required_artifacts or not all(
-        _is_sha256(artifact_hashes[name]) for name in required_artifacts
-    ):
-        raise ValueError("candidate lock artifact hashes are invalid")
+    if not _is_sha256(payload.get("checkpoint_sha256")):
+        raise ValueError("candidate lock checkpoint hash is invalid")
     _validate_candidate_gates(payload.get("gates"))
     return payload
 

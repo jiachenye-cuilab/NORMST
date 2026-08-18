@@ -128,6 +128,41 @@ def _idw_prediction_tree_hash(run: dict[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def _matched_fold_contract_value(run: dict[str, Any], field: str) -> str:
+    contract = run.get("contract")
+    if not isinstance(contract, dict) or field not in contract:
+        raise ValueError(f"{run['run_dir']}: contract is missing {field}")
+    value = contract[field]
+    if not isinstance(value, dict):
+        raise ValueError(f"{run['run_dir']}: contract field {field} must be an object")
+    return canonical_json(value)
+
+
+def _matched_train_val_slice_contract(run: dict[str, Any]) -> str:
+    contract = run.get("contract")
+    slices = contract.get("slice_data_and_geometry") if isinstance(contract, dict) else None
+    if not isinstance(slices, dict):
+        raise ValueError(
+            f"{run['run_dir']}: contract is missing slice_data_and_geometry"
+        )
+    selected: dict[str, Any] = {}
+    roles: set[str] = set()
+    for slice_id, item in slices.items():
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{run['run_dir']}: slice_data_and_geometry entry is invalid: {slice_id}"
+            )
+        role = item.get("role")
+        if role in {"train", "val"}:
+            selected[str(slice_id)] = item
+            roles.add(str(role))
+    if roles != {"train", "val"}:
+        raise ValueError(
+            f"{run['run_dir']}: contract must contain train and val slice data"
+        )
+    return canonical_json(selected)
+
+
 def load_formal_matrix(path: str | Path) -> dict[tuple[str, int, str], dict[str, Any]]:
     matrix_path = Path(path).resolve()
     payload = _read_json(matrix_path)
@@ -162,6 +197,15 @@ def load_formal_matrix(path: str | Path) -> dict[tuple[str, int, str], dict[str,
 
     for fold in FOLDS:
         fold_runs = [run for identity, run in runs.items() if identity[0] == fold]
+        preprocessing_contracts = {
+            _matched_fold_contract_value(run, "preprocessing") for run in fold_runs
+        }
+        split_contracts = {
+            _matched_fold_contract_value(run, "split") for run in fold_runs
+        }
+        train_val_slice_contracts = {
+            _matched_train_val_slice_contract(run) for run in fold_runs
+        }
         mask_contracts = {
             canonical_json(run["contract"]["fixed_mask_banks"]) for run in fold_runs
         }
@@ -181,13 +225,22 @@ def load_formal_matrix(path: str | Path) -> dict[tuple[str, int, str], dict[str,
             for run in fold_runs
         }
         idw_prediction_hashes = {_idw_prediction_tree_hash(run) for run in fold_runs}
+        if len(preprocessing_contracts) != 1:
+            raise ValueError(f"{fold}: matched preprocessing contract drifted")
+        if len(split_contracts) != 1:
+            raise ValueError(f"{fold}: matched split contract drifted")
+        if len(train_val_slice_contracts) != 1:
+            raise ValueError(
+                f"{fold}: matched train/val slice data or geometry drifted"
+            )
+        if len(mask_contracts) != 1:
+            raise ValueError(f"{fold}: matched fixed mask banks drifted")
         if (
-            len(mask_contracts) != 1
-            or len(test_identities) != 1
+            len(test_identities) != 1
             or len(idw_summaries) != 1
             or len(idw_prediction_hashes) != 1
         ):
-            raise ValueError(f"{fold}: matched masks, test identity, or IDW baseline drifted")
+            raise ValueError(f"{fold}: matched test identity or IDW baseline drifted")
     return runs
 
 
@@ -333,19 +386,33 @@ def summarize_formal_matrix(
     gap_one: dict[tuple[str, int], float] = {}
     ordinary_idw: dict[tuple[str, int], float] = {}
     ordinary_one: dict[tuple[str, int], float] = {}
+    ordinary_local: dict[tuple[str, int], float] = {}
+    ordinary_global: dict[tuple[str, int], float] = {}
+    gap_local: dict[tuple[str, int], float] = {}
+    gap_global: dict[tuple[str, int], float] = {}
     depth2: dict[tuple[str, int], float] = {}
     depth34: dict[tuple[str, int], float] = {}
     for fold in FOLDS:
         for seed in SEEDS:
             full = runs[(fold, seed, "full")]
             one = runs[(fold, seed, "one-shot")]
+            local = runs[(fold, seed, "local-only")]
+            global_only = runs[(fold, seed, "global-only")]
             identity = (fold, seed)
             full_gap = _smooth_l1(full, 4, "gap")
             gap_idw[identity] = _smooth_l1(full, 4, "gap", section="idw") - full_gap
             gap_one[identity] = _smooth_l1(one, 1, "gap") - full_gap
+            gap_local[identity] = _smooth_l1(local, 4, "gap") - full_gap
+            gap_global[identity] = _smooth_l1(global_only, 4, "gap") - full_gap
             full_ordinary = _smooth_l1(full, 4, "ordinary")
             idw_ordinary = _smooth_l1(full, 4, "ordinary", section="idw")
             one_ordinary = _smooth_l1(one, 1, "ordinary")
+            ordinary_local[identity] = (
+                _smooth_l1(local, 4, "ordinary") - full_ordinary
+            )
+            ordinary_global[identity] = (
+                _smooth_l1(global_only, 4, "ordinary") - full_ordinary
+            )
             if idw_ordinary <= 0 or one_ordinary <= 0:
                 raise ValueError("ordinary relative deterioration denominator must be positive")
             ordinary_idw[identity] = (full_ordinary - idw_ordinary) / idw_ordinary
@@ -362,6 +429,10 @@ def summarize_formal_matrix(
         "gap_full_vs_one_shot_gain": _effect_summary(gap_one),
         "ordinary_full_vs_idw_relative_deterioration": _effect_summary(ordinary_idw),
         "ordinary_full_vs_one_shot_relative_deterioration": _effect_summary(ordinary_one),
+        "ordinary_full_vs_local_only_gain": _effect_summary(ordinary_local),
+        "ordinary_full_vs_global_only_gain": _effect_summary(ordinary_global),
+        "gap_full_vs_local_only_gain": _effect_summary(gap_local),
+        "gap_full_vs_global_only_gain": _effect_summary(gap_global),
         "gap_depth2_round2_vs_round1_gain": _effect_summary(depth2),
         "gap_depth3_4_round4_vs_round2_gain": _effect_summary(depth34),
     }
@@ -397,7 +468,7 @@ def summarize_formal_matrix(
         ),
     }
     return {
-        "schema": "pro-normst-formal-acceptance-v1",
+        "schema": "pro-normst-formal-acceptance-v2",
         "depth_acceptance_family": DEPTH_ACCEPTANCE_FAMILY,
         "accepted": all(checks.values()),
         "checks": checks,
