@@ -442,6 +442,8 @@ class SharedAlignedLocalOperator(nn.Module):
         source_type_dim: int = 8,
         gamma: float = 0.95,
         reliability_eps: float = 1e-8,
+        direction_init_std: float = 1e-3,
+        routing_init_std: float = 1e-3,
     ):
         super().__init__()
         if min(latent_dim, num_heads, hidden_dim, source_type_dim) < 1:
@@ -450,12 +452,16 @@ class SharedAlignedLocalOperator(nn.Module):
             raise ValueError("gamma must be in (0,1]")
         if reliability_eps <= 0:
             raise ValueError("reliability_eps must be positive")
+        if direction_init_std <= 0 or routing_init_std <= 0:
+            raise ValueError("local routing initialization scales must be positive")
         self.latent_dim = int(latent_dim)
         self.num_heads = int(num_heads)
         self.hidden_dim = int(hidden_dim)
         self.source_type_dim = int(source_type_dim)
         self.gamma = float(gamma)
         self.reliability_eps = float(reliability_eps)
+        self.direction_init_std = float(direction_init_std)
+        self.routing_init_std = float(routing_init_std)
 
         # Type 0 is original-visible; type 1 is an earlier-round query.
         self.source_type_embedding = nn.Embedding(2, self.source_type_dim)
@@ -473,9 +479,11 @@ class SharedAlignedLocalOperator(nn.Module):
         nn.init.normal_(self.source_type_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.lambda_head.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.lambda_head.bias)
-        nn.init.normal_(self.direction_head.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(
+            self.direction_head.weight, mean=0.0, std=self.direction_init_std
+        )
         nn.init.zeros_(self.direction_head.bias)
-        nn.init.normal_(self.routing_logits, mean=0.0, std=1e-3)
+        nn.init.normal_(self.routing_logits, mean=0.0, std=self.routing_init_std)
 
     def forward(
         self,

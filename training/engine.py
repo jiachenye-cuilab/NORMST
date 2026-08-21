@@ -180,23 +180,6 @@ def _masked_correlations(prediction, target, mask, epsilon=1e-8):
     return (numerator / denominator)[valid]
 
 
-def _gene_variance_mean(prediction, mask, task):
-    if task == "visium":
-        values = prediction.transpose(1, 2)
-        weight = mask.transpose(1, 2).expand(-1, prediction.shape[2], -1)
-    else:
-        values = prediction.flatten(2)
-        weight = mask.flatten(2).expand(-1, prediction.shape[1], -1)
-    weight = weight.to(values.dtype)
-    count = weight.sum(dim=-1).clamp_min(1.0)
-    mean = (values.float() * weight).sum(dim=-1) / count
-    variance = (
-        (values.float() - mean[..., None]).square() * weight
-    ).sum(dim=-1) / count
-    valid = count >= 2
-    return variance[valid].mean() if valid.any() else values.sum() * 0.0
-
-
 def _gene_value_moments(prediction, mask, task):
     """Return pooled per-gene sum, square sum, and valid count."""
     values = prediction.detach().float()

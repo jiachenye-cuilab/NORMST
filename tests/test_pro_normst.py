@@ -7,8 +7,11 @@ import inspect
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -24,26 +27,41 @@ from datasets.pro_normst import (
     load_split_manifest,
     prepare_pro_normst_data,
 )
-from models.pro_normst import FullHexGeometry, ProNORMST
+from models.pro_normst import FullHexGeometry, ProNORMST, ResidualLocalStateEnhancer
 from training.pro_normst import (
+    HUMAN_CONTRACT_VERSION,
+    NUMERICAL_IMPLEMENTATION_SCHEMA,
+    OPTIMIZATION_CONTRACT,
     _checkpoint_payload,
     _evaluate_role,
-    _final_loss_bptt_gate,
     _load_checkpoint,
     _numerical_contract_hash,
     _pilot_gate,
     _run_test_once,
+    _save_training_mask_epoch,
+    _train_one_epoch,
     _validate_args,
     _validate_candidate_lock,
     _validate_existing_run,
+    _validate_run_checkpoint_lock,
     _write_candidate_lock,
+    _write_run_checkpoint_lock,
 )
 from training.pro_normst_engine import (
+    PersistentIDWCache,
+    _scientific_metrics_for_selectors,
+    build_padded_model_batch,
+    capture_rng_state,
+    diagnostic_summary,
     learning_rate_for_step,
     evaluate_mask,
+    evaluate_masks,
     optimizer_for_model,
+    restore_rng_state,
+    scientific_metrics,
     strict_visible_idw,
     weighted_gene_smooth_l1,
+    weighted_gene_smooth_l1_per_item,
 )
 from training.pro_normst_masks import (
     build_mask_geometry,
@@ -82,6 +100,36 @@ def rectangular_hex_graph(rows: int = 15, columns: int = 15) -> np.ndarray:
     return neighbor
 
 
+def synthetic_slice(
+    slice_id: str,
+    *,
+    nodes: int = 6,
+    role: str = "train",
+    expression_offset: float = 0.0,
+) -> ProNORMSTSlice:
+    geometry = line_geometry(nodes)
+    expression = (
+        np.linspace(0.0, 1.0, nodes * 512, dtype=np.float32).reshape(nodes, 512)
+        + expression_offset
+    )
+    return ProNORMSTSlice(
+        slice_id=slice_id,
+        role=role,
+        donor=f"donor-{slice_id}",
+        pair=f"pair-{slice_id}",
+        barcodes=tuple(f"{slice_id}-b{index}" for index in range(nodes)),
+        gene_ids=tuple(f"g{index}" for index in range(512)),
+        expression_x=expression.copy(),
+        expression_z=expression.copy(),
+        array_row=np.arange(nodes, dtype=np.int64),
+        array_col=np.arange(nodes, dtype=np.int64),
+        full_xy=geometry.xy.numpy(),
+        neighbor_index=geometry.neighbor_index.numpy(),
+        native_scale=1.0,
+        component_id=np.zeros(nodes, dtype=np.int32),
+    )
+
+
 class DirectModelContractTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(2027)
@@ -96,7 +144,13 @@ class DirectModelContractTest(unittest.TestCase):
         self.assertNotIn("query_expression", signature.parameters)
         self.assertNotIn("target", signature.parameters)
         self.assertFalse(hasattr(self.model, "latent_encoder"))
-        self.assertFalse(any("encoder" in name for name, _ in self.model.named_parameters()))
+        self.assertFalse(any("ae" in name for name, _ in self.model.named_parameters()))
+        self.assertTrue(
+            any(
+                name.startswith("global_input_encoder.")
+                for name, _ in self.model.named_parameters()
+            )
+        )
         self.assertEqual(self.model.state_dim, 512)
         self.assertFalse(self.model.contract_manifest()["query_truth_in_forward"])
 
@@ -111,6 +165,111 @@ class DirectModelContractTest(unittest.TestCase):
         torch.testing.assert_close(auxiliary["visible_state"], self.visible)
         torch.testing.assert_close(auxiliary["full_state"][0, 0], self.visible[0, 0])
 
+    def test_global_encoder_is_zero_initialized_and_initially_identity(self):
+        encoder = self.model.global_input_encoder
+        torch.testing.assert_close(
+            encoder.output_projection.weight,
+            torch.zeros_like(encoder.output_projection.weight),
+        )
+        torch.testing.assert_close(
+            encoder.output_projection.bias,
+            torch.zeros_like(encoder.output_projection.bias),
+        )
+        _, auxiliary = self.model(
+            self.visible,
+            self.visible_index,
+            self.query_index,
+            self.geometry,
+            return_auxiliary=True,
+        )
+        torch.testing.assert_close(auxiliary["global_input_state"], self.visible)
+        torch.testing.assert_close(
+            auxiliary["global_input_residual"],
+            torch.zeros_like(auxiliary["global_input_residual"]),
+        )
+        self.assertEqual(sum(p.numel() for p in self.model.parameters()), 1_914_241)
+
+    def test_local_enhancer_is_zero_initialized_and_fixed_gate_is_restored(self):
+        enhancer = self.model.local_state_enhancer
+        torch.testing.assert_close(
+            enhancer.output_projection.weight,
+            torch.zeros_like(enhancer.output_projection.weight),
+        )
+        torch.testing.assert_close(
+            enhancer.output_projection.bias,
+            torch.zeros_like(enhancer.output_projection.bias),
+        )
+        _, auxiliary = self.model(
+            self.visible,
+            self.visible_index,
+            self.query_index,
+            self.geometry,
+            return_auxiliary=True,
+        )
+        active = auxiliary["active_query"]
+        torch.testing.assert_close(
+            auxiliary["local_state_enhanced"][active],
+            auxiliary["local_state"][active],
+        )
+        torch.testing.assert_close(
+            auxiliary["local_state_residual"],
+            torch.zeros_like(auxiliary["local_state_residual"]),
+        )
+        expected_gate = (
+            active[..., None].to(auxiliary["coverage"].dtype)
+            * auxiliary["coverage"]
+            * auxiliary["confidence"]
+        )
+        torch.testing.assert_close(auxiliary["gate"], expected_gate)
+        self.assertFalse(auxiliary["gate"].requires_grad)
+        torch.testing.assert_close(
+            auxiliary["gated_local"][~active],
+            torch.zeros_like(auxiliary["gated_local"][~active]),
+        )
+
+    def test_local_enhancer_gradient_is_reachable(self):
+        with torch.no_grad():
+            self.model.local_state_enhancer.output_projection.weight.fill_(0.05)
+        prediction = self.model(
+            self.visible,
+            self.visible_index,
+            self.query_index,
+            self.geometry,
+        )
+        prediction.square().mean().backward()
+        for parameter in self.model.local_state_enhancer.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+            self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
+
+    def test_local_enhancer_global_condition_is_stop_gradient(self):
+        local_state = torch.randn(4, 512, requires_grad=True)
+        global_context = torch.randn(4, 256, requires_grad=True)
+        with torch.no_grad():
+            self.model.local_state_enhancer.output_projection.weight.fill_(0.05)
+        output = self.model.local_state_enhancer(local_state, global_context)
+        output.square().mean().backward()
+        self.assertIsNotNone(local_state.grad)
+        self.assertGreater(float(local_state.grad.abs().sum()), 0.0)
+        self.assertIsNone(global_context.grad)
+
+    def test_round8_diagnostics_include_encoder_and_local_enhancer_statistics(self):
+        _, auxiliary = self.model(
+            self.visible,
+            self.visible_index,
+            self.query_index,
+            self.geometry,
+            return_auxiliary=True,
+        )
+        summary = diagnostic_summary(auxiliary, gradient_norm=None)
+        self.assertEqual(summary["global_input_residual_ratio"], 0.0)
+        self.assertEqual(summary["local_state_enhancer_residual_rms"], 0.0)
+        self.assertEqual(summary["local_state_enhancer_residual_ratio"], 0.0)
+        self.assertEqual(
+            summary["local_state_effective_rank"],
+            summary["local_state_enhanced_effective_rank"],
+        )
+
     def test_global_memory_contains_original_visible_nodes_only(self):
         _, auxiliary = self.model(
             self.visible,
@@ -123,6 +282,35 @@ class DirectModelContractTest(unittest.TestCase):
         attention = auxiliary["global_diagnostics"]["attention"]
         self.assertEqual(attention.shape, (1, 8, 5, 1))
         torch.testing.assert_close(attention, torch.ones_like(attention))
+
+    def test_six_spatial_slots_use_fixed_aligned_two_hop_paths(self):
+        geometry = line_geometry(nodes=3)
+        visible = torch.zeros(1, 2, 512)
+        visible[0, 0, 0] = 1.0
+        visible[0, 1, 0] = 3.0
+        descriptors = []
+
+        def capture_descriptor(_module, inputs):
+            descriptors.append(inputs[0].detach().clone())
+
+        handle = self.model.local_operator.path_trunk.register_forward_pre_hook(
+            capture_descriptor
+        )
+        try:
+            self.model(
+                visible,
+                torch.tensor([0, 1]),
+                torch.tensor([2]),
+                geometry,
+                round_limit=1,
+            )
+        finally:
+            handle.remove()
+        descriptor = descriptors[0]
+        self.assertEqual(descriptor.shape[2], 6)
+        self.assertEqual(float(descriptor[0, 2, 0, 0]), 3.0)
+        self.assertEqual(float(descriptor[0, 2, 0, 512]), 2.0)
+        self.assertEqual(float(descriptor[0, 2, 0, 1024]), 1.0)
 
     def test_same_checkpoint_early_exit_invariance(self):
         prediction1, auxiliary1 = self.model(
@@ -203,11 +391,15 @@ class DirectModelContractTest(unittest.TestCase):
             self.assertGreater(float(state.grad.abs().sum()), 0.0)
 
     def test_local_projection_receives_only_activated_queries(self):
+        enhanced_rows = []
         projected_rows = []
 
         def record_rows(_module, inputs):
             projected_rows.append(int(inputs[0].shape[0]))
 
+        enhancer_handle = self.model.local_state_enhancer.register_forward_pre_hook(
+            lambda _module, inputs: enhanced_rows.append(int(inputs[0].shape[0]))
+        )
         handle = self.model.local_projection.register_forward_pre_hook(record_rows)
         try:
             _, auxiliary = self.model(
@@ -219,8 +411,17 @@ class DirectModelContractTest(unittest.TestCase):
             )
         finally:
             handle.remove()
+            enhancer_handle.remove()
         active = auxiliary["active_query"]
-        self.assertEqual(projected_rows, [int(active.sum().item())])
+        activation_round = auxiliary["activation_round"]
+        expected_rows = [
+            int((activation_round == round_index).sum().item())
+            for round_index in range(1, self.model.max_rounds + 1)
+            if bool((activation_round == round_index).any())
+        ]
+        self.assertEqual(enhanced_rows, expected_rows)
+        self.assertEqual(projected_rows, expected_rows)
+        self.assertEqual(sum(projected_rows), int(active.sum().item()))
         self.assertFalse(active[0, -1])
         torch.testing.assert_close(
             auxiliary["local_projected"][~active],
@@ -236,9 +437,109 @@ class DirectModelContractTest(unittest.TestCase):
         global_only = ProNORMST(torch.zeros(512), variant="global-only")
         self.assertTrue(all(not value.requires_grad for value in local.global_branch.parameters()))
         self.assertTrue(
+            all(
+                not value.requires_grad
+                for value in local.global_input_encoder.parameters()
+            )
+        )
+        self.assertTrue(
             all(not value.requires_grad for value in global_only.local_operator.parameters())
         )
-        self.assertFalse(any("gate" in name for name, _ in self.model.named_parameters()))
+        self.assertTrue(
+            all(
+                not value.requires_grad
+                for value in global_only.local_state_enhancer.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                value.requires_grad
+                for value in global_only.global_input_encoder.parameters()
+            )
+        )
+
+        calls = {"local_encoder": 0, "global_enhancer": 0}
+        local_conditions = []
+
+        def record_local_encoder(_module, _inputs):
+            calls["local_encoder"] += 1
+
+        def record_global_enhancer(_module, _inputs):
+            calls["global_enhancer"] += 1
+
+        encoder_handle = local.global_input_encoder.register_forward_pre_hook(
+            record_local_encoder
+        )
+        local_enhancer_handle = local.local_state_enhancer.register_forward_pre_hook(
+            lambda _module, inputs: local_conditions.append(inputs[1].detach().clone())
+        )
+        enhancer_handle = global_only.local_state_enhancer.register_forward_pre_hook(
+            record_global_enhancer
+        )
+        try:
+            local(
+                self.visible,
+                self.visible_index,
+                self.query_index,
+                self.geometry,
+            )
+            global_only(
+                self.visible,
+                self.visible_index,
+                self.query_index,
+                self.geometry,
+            )
+        finally:
+            encoder_handle.remove()
+            local_enhancer_handle.remove()
+            enhancer_handle.remove()
+        self.assertEqual(calls, {"local_encoder": 0, "global_enhancer": 0})
+        self.assertTrue(local_conditions)
+        for condition in local_conditions:
+            torch.testing.assert_close(condition, torch.zeros_like(condition))
+
+    def test_round8_manifest_freezes_conditioned_local_innovation_and_fixed_gate(self):
+        manifest = self.model.contract_manifest()
+        self.assertEqual(manifest["schema"], "pro-normst-direct-512-v6")
+        self.assertEqual(
+            manifest["global_input_encoder"], "residual-prenorm-gene-mlp-v1"
+        )
+        self.assertEqual(manifest["global_input_encoder_output_init"], "zeros")
+        self.assertEqual(
+            manifest["local_state_enhancer"],
+            "global-conditioned-residual-prenorm-local-mlp-v1",
+        )
+        self.assertEqual(manifest["local_state_enhancer_hidden_dim"], 256)
+        self.assertEqual(manifest["local_state_enhancer_input_dim"], 768)
+        self.assertEqual(manifest["local_state_enhancer_global_condition_dim"], 256)
+        self.assertEqual(
+            manifest["local_state_enhancer_global_condition_source"],
+            "fixed_original_visible_global_context",
+        )
+        self.assertTrue(
+            manifest["local_state_enhancer_global_condition_stop_gradient"]
+        )
+        self.assertEqual(manifest["local_state_enhancer_output_init"], "zeros")
+        self.assertFalse(manifest["gate_parameters"])
+        self.assertEqual(
+            manifest["local_fusion_gate"],
+            "active_x_coverage_x_confidence_fixed",
+        )
+        self.assertEqual(manifest["local_direction_init_std"], 1e-3)
+        self.assertEqual(manifest["local_routing_init_std"], 1e-3)
+
+    def test_historical_round7_enhancer_manifest_remains_auditable(self):
+        historical = ProNORMST(torch.zeros(512), variant="full")
+        historical.local_state_enhancer = ResidualLocalStateEnhancer()
+        manifest = historical.contract_manifest()
+        self.assertEqual(manifest["schema"], "pro-normst-direct-512-v5")
+        self.assertEqual(
+            manifest["local_state_enhancer"], "residual-prenorm-local-mlp-v1"
+        )
+        self.assertEqual(manifest["local_state_enhancer_input_dim"], 512)
+        self.assertNotIn(
+            "local_state_enhancer_global_condition_stop_gradient", manifest
+        )
 
     def test_indices_must_partition_the_complete_graph(self):
         with self.assertRaisesRegex(ValueError, "partition"):
@@ -306,6 +607,380 @@ class DirectModelContractTest(unittest.TestCase):
         )
         np.testing.assert_array_equal(first["prediction_z"], second["prediction_z"])
 
+    def test_fixed_mask_control_cache_is_exact_and_reuses_idw(self):
+        neighbor = self.geometry.neighbor_index.numpy()
+        mask = generate_ordinary_mask(
+            build_mask_geometry(neighbor),
+            make_mask_identity(
+                protocol="synthetic",
+                fold="fold0",
+                role="val",
+                slice_id="slice0",
+                family="ordinary",
+                mask_index=0,
+            ),
+        )
+        expression = np.linspace(0.0, 2.0, 6 * 512, dtype=np.float32).reshape(6, 512)
+        item = ProNORMSTSlice(
+            slice_id="slice0",
+            role="val",
+            donor="donor0",
+            pair="pair0",
+            barcodes=tuple(f"b{index}" for index in range(6)),
+            gene_ids=tuple(f"g{index}" for index in range(512)),
+            expression_x=expression,
+            expression_z=expression,
+            array_row=np.arange(6, dtype=np.int64),
+            array_col=np.arange(6, dtype=np.int64),
+            full_xy=np.column_stack((np.arange(6), np.zeros(6))).astype(np.float32),
+            neighbor_index=neighbor,
+            native_scale=1.0,
+            component_id=np.zeros(6, dtype=np.int32),
+        )
+        arguments = (
+            self.model.eval(),
+            item,
+            mask,
+            np.ones(512, dtype=np.float32),
+            np.ones(512, dtype=np.float32),
+            np.full(512, 0.5, dtype=np.float32),
+            torch.device("cpu"),
+        )
+        uncached = evaluate_mask(*arguments, use_amp=False)
+        control_cache = {}
+        with mock.patch(
+            "training.pro_normst_engine.strict_visible_idw",
+            wraps=strict_visible_idw,
+        ) as idw:
+            cached_first = evaluate_mask(
+                *arguments,
+                use_amp=False,
+                control_cache=control_cache,
+            )
+            cached_second = evaluate_mask(
+                *arguments,
+                use_amp=False,
+                control_cache=control_cache,
+            )
+        self.assertEqual(idw.call_count, 1)
+        self.assertEqual(len(control_cache), 1)
+        self.assertEqual(uncached, cached_first)
+        self.assertEqual(cached_first, cached_second)
+
+    def test_metric_selector_cache_preserves_exact_results(self):
+        generator = np.random.default_rng(2027)
+        prediction = generator.normal(size=(12, 8)).astype(np.float32)
+        target = generator.normal(size=(12, 8)).astype(np.float32)
+        rows = np.zeros(12, dtype=bool)
+        rows[:10] = True
+        selectors = {
+            "all": np.ones(12, dtype=bool),
+            "all-copy": np.ones(12, dtype=bool),
+            "first-ten": rows,
+            "first-ten-copy": rows.copy(),
+        }
+        full = scientific_metrics(prediction, target)
+        expected = {
+            name: scientific_metrics(
+                prediction[selector], target[selector], min_queries=10
+            )
+            for name, selector in selectors.items()
+        }
+        with mock.patch(
+            "training.pro_normst_engine.scientific_metrics",
+            wraps=scientific_metrics,
+        ) as metric:
+            actual = _scientific_metrics_for_selectors(
+                prediction,
+                target,
+                selectors,
+                axis=0,
+                min_queries=10,
+                full_metrics=full,
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(metric.call_count, 1)
+        self.assertIsNot(actual["all"], actual["all-copy"])
+
+        genes = {
+            "supported-a": np.ones(8, dtype=bool),
+            "supported-b": np.ones(8, dtype=bool),
+            "supported-c": np.ones(8, dtype=bool),
+        }
+        expected_genes = {
+            name: scientific_metrics(prediction[:, selector], target[:, selector])
+            for name, selector in genes.items()
+        }
+        with mock.patch(
+            "training.pro_normst_engine.scientific_metrics",
+            wraps=scientific_metrics,
+        ) as metric:
+            actual_genes = _scientific_metrics_for_selectors(
+                prediction,
+                target,
+                genes,
+                axis=1,
+                min_queries=1,
+                full_metrics=full,
+            )
+        self.assertEqual(actual_genes, expected_genes)
+        self.assertEqual(metric.call_count, 1)
+
+    def test_persistent_idw_cache_is_content_addressed_and_exact(self):
+        item = synthetic_slice("slice-idw-cache", role="val")
+        mask = generate_ordinary_mask(
+            build_mask_geometry(item.neighbor_index),
+            make_mask_identity(
+                protocol="synthetic",
+                fold="fold0",
+                role="val",
+                slice_id=item.slice_id,
+                family="ordinary",
+                mask_index=0,
+            ),
+        )
+
+        def compute() -> np.ndarray:
+            return strict_visible_idw(
+                item.expression_x[mask.visible_index],
+                item.full_xy[mask.visible_index],
+                mask.visible_index,
+                item.full_xy[mask.query_index],
+            )
+
+        expected = compute()
+        with tempfile.TemporaryDirectory() as temporary:
+            first_cache = PersistentIDWCache(temporary)
+            with mock.patch.object(
+                first_cache,
+                "_write",
+                wraps=first_cache._write,
+            ) as writer:
+                first = first_cache.get_or_compute(item, mask, compute)
+            self.assertEqual(writer.call_count, 1)
+            self.assertEqual(first_cache.misses, 1)
+            self.assertEqual(first_cache.writes, 1)
+
+            second_cache = PersistentIDWCache(temporary)
+            second = second_cache.get_or_compute(
+                item,
+                mask,
+                lambda: self.fail("persistent cache unexpectedly recomputed IDW"),
+            )
+            np.testing.assert_array_equal(first, expected)
+            np.testing.assert_array_equal(second, expected)
+            self.assertEqual(second_cache.hits, 1)
+            self.assertFalse(second.flags.writeable)
+
+            changed_item = synthetic_slice(
+                item.slice_id,
+                role="val",
+                expression_offset=0.25,
+            )
+            changed_expected = strict_visible_idw(
+                changed_item.expression_x[mask.visible_index],
+                changed_item.full_xy[mask.visible_index],
+                mask.visible_index,
+                changed_item.full_xy[mask.query_index],
+            )
+            changed_cache = PersistentIDWCache(temporary)
+            changed = changed_cache.get_or_compute(
+                changed_item,
+                mask,
+                lambda: changed_expected,
+            )
+            np.testing.assert_array_equal(changed, changed_expected)
+            self.assertEqual(changed_cache.misses, 1)
+            self.assertEqual(changed_cache.writes, 1)
+            self.assertEqual(len(list(Path(temporary).rglob("*.npz"))), 2)
+
+    def test_persistent_idw_cache_rejects_corruption(self):
+        item = synthetic_slice("slice-idw-corrupt", role="val")
+        mask = generate_ordinary_mask(
+            build_mask_geometry(item.neighbor_index),
+            make_mask_identity(
+                protocol="synthetic",
+                fold="fold0",
+                role="val",
+                slice_id=item.slice_id,
+                family="ordinary",
+                mask_index=0,
+            ),
+        )
+
+        def compute() -> np.ndarray:
+            return strict_visible_idw(
+                item.expression_x[mask.visible_index],
+                item.full_xy[mask.visible_index],
+                mask.visible_index,
+                item.full_xy[mask.query_index],
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = PersistentIDWCache(temporary)
+            cache.get_or_compute(item, mask, compute)
+            artifact = next(Path(temporary).rglob("*.npz"))
+            artifact.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(ValueError, "cache artifact is invalid"):
+                PersistentIDWCache(temporary).get_or_compute(item, mask, compute)
+
+    def test_persistent_idw_cache_serializes_concurrent_writers(self):
+        item = synthetic_slice("slice-idw-concurrent", role="val")
+        mask = generate_ordinary_mask(
+            build_mask_geometry(item.neighbor_index),
+            make_mask_identity(
+                protocol="synthetic",
+                fold="fold0",
+                role="val",
+                slice_id=item.slice_id,
+                family="ordinary",
+                mask_index=0,
+            ),
+        )
+        expected = strict_visible_idw(
+            item.expression_x[mask.visible_index],
+            item.full_xy[mask.visible_index],
+            mask.visible_index,
+            item.full_xy[mask.query_index],
+        )
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def compute() -> np.ndarray:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.05)
+            return expected
+
+        with tempfile.TemporaryDirectory() as temporary:
+            caches = [PersistentIDWCache(temporary), PersistentIDWCache(temporary)]
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(
+                        lambda cache: cache.get_or_compute(item, mask, compute),
+                        caches,
+                    )
+                )
+        self.assertEqual(calls, 1)
+        self.assertEqual(sum(cache.writes for cache in caches), 1)
+        self.assertEqual(sum(cache.hits for cache in caches), 1)
+        for result in results:
+            np.testing.assert_array_equal(result, expected)
+
+    def test_batched_mask_evaluation_matches_individual_masks(self):
+        item = synthetic_slice("slice-batch", role="val")
+        geometry = build_mask_geometry(item.neighbor_index)
+        masks = tuple(
+            generate_ordinary_mask(
+                geometry,
+                make_mask_identity(
+                    protocol="synthetic",
+                    fold="fold0",
+                    role="val",
+                    slice_id=item.slice_id,
+                    family="ordinary",
+                    mask_index=index,
+                ),
+            )
+            for index in range(4)
+        )
+        arguments = (
+            np.ones(512, dtype=np.float32),
+            np.ones(512, dtype=np.float32),
+            np.full(512, 0.5, dtype=np.float32),
+            torch.device("cpu"),
+        )
+        individual = [
+            evaluate_mask(
+                self.model.eval(),
+                item,
+                mask,
+                *arguments,
+                use_amp=False,
+                return_prediction=True,
+            )
+            for mask in masks
+        ]
+        batched = evaluate_masks(
+            self.model.eval(),
+            item,
+            masks,
+            *arguments,
+            use_amp=False,
+            return_prediction=True,
+        )
+        self.assertEqual(len(batched), len(individual))
+        for expected, actual in zip(individual, batched, strict=True):
+            np.testing.assert_allclose(
+                actual["prediction_z"],
+                expected["prediction_z"],
+                rtol=1e-5,
+                atol=1e-6,
+            )
+            self.assertAlmostEqual(
+                actual["weighted_z_smooth_l1"],
+                expected["weighted_z_smooth_l1"],
+                places=6,
+            )
+            self.assertAlmostEqual(
+                actual["model"]["smooth_l1"],
+                expected["model"]["smooth_l1"],
+                places=6,
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_amp_batched_masks_match_individual_tolerance(self):
+        model = ProNORMST(torch.zeros(512), variant="full").cuda().eval()
+        item = synthetic_slice("slice-cuda-batch", role="val")
+        geometry = build_mask_geometry(item.neighbor_index)
+        masks = tuple(
+            generate_ordinary_mask(
+                geometry,
+                make_mask_identity(
+                    protocol="synthetic",
+                    fold="fold0",
+                    role="val",
+                    slice_id=item.slice_id,
+                    family="ordinary",
+                    mask_index=index,
+                ),
+            )
+            for index in range(4)
+        )
+        arguments = (
+            np.ones(512, dtype=np.float32),
+            np.ones(512, dtype=np.float32),
+            np.full(512, 0.5, dtype=np.float32),
+            torch.device("cuda"),
+        )
+        individual = [
+            evaluate_mask(
+                model,
+                item,
+                mask,
+                *arguments,
+                use_amp=True,
+                return_prediction=True,
+            )["prediction_z"]
+            for mask in masks
+        ]
+        batched = evaluate_masks(
+            model,
+            item,
+            masks,
+            *arguments,
+            use_amp=True,
+            return_prediction=True,
+        )
+        for expected, actual in zip(individual, batched, strict=True):
+            np.testing.assert_allclose(
+                actual["prediction_z"],
+                expected,
+                rtol=2e-3,
+                atol=2e-4,
+            )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cpu_cuda_and_amp_forward_tolerance(self):
         cpu_model = self.model.eval()
@@ -338,6 +1013,66 @@ class DirectModelContractTest(unittest.TestCase):
                 ).float().cpu()
         torch.testing.assert_close(cpu_prediction, cuda_prediction, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(cuda_prediction, amp_prediction, rtol=2e-2, atol=2e-2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_amp_projection_shape_is_early_exit_invariant(self):
+        neighbor = rectangular_hex_graph()
+        mask = generate_gap_mask(
+            build_mask_geometry(neighbor),
+            make_mask_identity(
+                protocol="synthetic",
+                fold="fold0",
+                role="val",
+                slice_id="slice0",
+                family="gap",
+                mask_index=0,
+            ),
+        )
+        nodes = neighbor.shape[0]
+        geometry = FullHexGeometry(
+            xy=torch.column_stack(
+                (torch.arange(nodes, dtype=torch.float32), torch.zeros(nodes))
+            ).cuda(),
+            neighbor_index=torch.from_numpy(neighbor).cuda(),
+            indices_validated=True,
+        )
+        generator = torch.Generator(device="cpu").manual_seed(2027)
+        visible = torch.randn(
+            1,
+            mask.visible_index.size,
+            512,
+            generator=generator,
+        ).cuda()
+        model = ProNORMST(torch.zeros(512), variant="full").cuda().eval()
+        predictions = {}
+        auxiliaries = {}
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            for round_limit in (1, 2, 4):
+                predictions[round_limit], auxiliaries[round_limit] = model(
+                    visible,
+                    torch.from_numpy(mask.visible_index).cuda(),
+                    torch.from_numpy(mask.query_index).cuda(),
+                    geometry,
+                    round_limit=round_limit,
+                    return_auxiliary=True,
+                )
+        final_round = auxiliaries[4]["activation_round"]
+        depth1 = final_round == 1
+        depth2 = final_round == 2
+        self.assertTrue(bool(depth1.any()))
+        self.assertTrue(bool(depth2.any()))
+        for left, right, selector in (
+            (1, 2, depth1),
+            (1, 4, depth1),
+            (2, 4, depth1),
+            (2, 4, depth2),
+        ):
+            torch.testing.assert_close(
+                predictions[left][selector],
+                predictions[right][selector],
+                rtol=0.0,
+                atol=0.0,
+            )
 
 
 class MaskContractTest(unittest.TestCase):
@@ -440,6 +1175,8 @@ class FrozenSplitAndDeferredTestDataTest(unittest.TestCase):
             seed=2027,
             variant="full",
             candidate_lock=None,
+            round_id="round-001",
+            round_reason="baseline contract candidate",
         )
         with self.assertRaisesRegex(ValueError, "candidate-lock"):
             _validate_args(Namespace(**common), "pair_grouped_lodo")
@@ -565,6 +1302,19 @@ class FrozenSplitAndDeferredTestDataTest(unittest.TestCase):
 
 
 class DataAndObjectiveContractTest(unittest.TestCase):
+    def test_v9_contract_freezes_batch_four_execution(self):
+        self.assertEqual(HUMAN_CONTRACT_VERSION, "pro-normst-human-v9")
+        self.assertEqual(
+            NUMERICAL_IMPLEMENTATION_SCHEMA,
+            "pro-normst-numerical-v9",
+        )
+        self.assertEqual(OPTIMIZATION_CONTRACT["train_slice_batch_size"], 4)
+        self.assertEqual(OPTIMIZATION_CONTRACT["evaluation_mask_batch_size"], 4)
+        self.assertEqual(
+            OPTIMIZATION_CONTRACT["batch_loss_reduction"],
+            "per-slice-gene-equal-then-slice-equal",
+        )
+
     def test_unified_entrypoint_dispatches_to_direct_training(self):
         import train
 
@@ -589,8 +1339,10 @@ class DataAndObjectiveContractTest(unittest.TestCase):
     @staticmethod
     def _contract_fixture():
         return {
-            "schema": "pro-normst-training-contract-v3",
-            "numerical_implementation_schema": "pro-normst-numerical-v1",
+            "schema": "pro-normst-training-contract-v4",
+            "human_contract_version": "pro-normst-human-v9",
+            "round": {"identity": "round-001", "reason": "baseline"},
+            "numerical_implementation_schema": "pro-normst-numerical-v9",
             "model": {
                 "schema": "model",
                 "variant": "full",
@@ -636,6 +1388,10 @@ class DataAndObjectiveContractTest(unittest.TestCase):
         numerical_drift["preprocessing"]["panel_ordered_sha256"] = "different-panel"
         self.assertNotEqual(_numerical_contract_hash(numerical_drift), baseline)
 
+        enhancer_drift = copy.deepcopy(contract)
+        enhancer_drift["model"]["local_state_enhancer_hidden_dim"] = 32
+        self.assertNotEqual(_numerical_contract_hash(enhancer_drift), baseline)
+
     def test_resume_allows_runtime_provenance_drift_with_warning(self):
         saved_contract = self._contract_fixture()
         current_contract = copy.deepcopy(saved_contract)
@@ -654,7 +1410,14 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             manifest = root / "split.json"
             manifest.write_text(json.dumps({"split": "fixed"}), encoding="utf-8")
             (root / "config.json").write_text(
-                json.dumps({"contract_hash": contract_hash}), encoding="utf-8"
+                json.dumps(
+                    {
+                        "contract_hash": contract_hash,
+                        "round_identity": "round-001",
+                        "round_reason": "baseline",
+                    }
+                ),
+                encoding="utf-8",
             )
             (root / "contract_manifest.json").write_text(
                 json.dumps(saved_contract), encoding="utf-8"
@@ -669,6 +1432,23 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             )
             (root / "split_manifest.snapshot.json").write_text(
                 manifest.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (root / "round_freeze.json").write_text(
+                json.dumps(
+                    {
+                        "human_contract_version": "pro-normst-human-v9",
+                        "round_identity": "round-001",
+                        "round_reason": "baseline",
+                        "numerical_contract_sha256": contract_hash,
+                        "config": {
+                            "contract_hash": contract_hash,
+                            "round_identity": "round-001",
+                            "round_reason": "baseline",
+                        },
+                        "contract_manifest": saved_contract,
+                    }
+                ),
+                encoding="utf-8",
             )
             with self.assertWarnsRegex(RuntimeWarning, "audit provenance changed"):
                 _validate_existing_run(
@@ -688,6 +1468,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
                 "variant": "full",
                 "initialization_seed": 2027,
                 "smoke": False,
+                "round_identity": "round-001",
             },
             "gradient_gate.json": {
                 "passed": True,
@@ -725,12 +1506,14 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             (root / "best.pt").write_bytes(b"checkpoint")
             candidate_lock = _write_candidate_lock(root, contract)
             payload = _validate_candidate_lock(candidate_lock, contract)
-            self.assertEqual(payload["schema"], "pro-normst-candidate-lock-v3")
+            self.assertEqual(payload["schema"], "pro-normst-candidate-lock-v4")
             self.assertEqual(
                 set(payload),
                 {
                     "schema",
                     "status",
+                    "human_contract_version",
+                    "round_identity",
                     "candidate_signature",
                     "candidate_signature_sha256",
                     "pilot_identity",
@@ -788,6 +1571,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
                     "variant": "full",
                     "initialization_seed": 2027,
                     "smoke": False,
+                    "round_identity": "round-001",
                 },
                 "gradient_gate.json": {
                     "passed": True,
@@ -823,6 +1607,199 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             (root / "best.pt").write_bytes(b"checkpoint")
             with self.assertRaisesRegex(RuntimeError, "candidate-lock contract"):
                 _write_candidate_lock(root, contract)
+
+    def test_formal_checkpoint_lock_precedes_and_binds_test_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint_path = root / "best.pt"
+            checkpoint_path.write_bytes(b"locked checkpoint")
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "protocol": "pair_grouped_lodo",
+                        "round_identity": "round-001",
+                        "fold": "lodo_d1",
+                        "initialization_seed": 2027,
+                        "variant": "full",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lock_path = _write_run_checkpoint_lock(
+                root,
+                checkpoint_path,
+                {"best_epoch": 4, "best_value": 0.5},
+                "contract",
+            )
+            payload = _validate_run_checkpoint_lock(
+                lock_path, checkpoint_path, "contract"
+            )
+            self.assertEqual(payload["best_epoch"], 4)
+            checkpoint_path.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "checkpoint lock"):
+                _validate_run_checkpoint_lock(lock_path, checkpoint_path, "contract")
+
+    def test_training_mask_epoch_preserves_per_query_metadata(self):
+        geometry = build_mask_geometry(rectangular_hex_graph(rows=5, columns=5))
+        masks = [
+            generate_ordinary_mask(
+                geometry,
+                make_mask_identity(
+                    protocol="synthetic",
+                    fold="fold0",
+                    role="train",
+                    slice_id="slice0",
+                    family="ordinary",
+                    mask_index=index,
+                ),
+            )
+            for index in range(2)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _save_training_mask_epoch(root, 1, masks)
+            with np.load(root / "training_masks" / "epoch_001.npz") as arrays:
+                self.assertEqual(arrays["offsets"].shape, (3,))
+                self.assertEqual(arrays["query_index"].size, sum(mask.query_index.size for mask in masks))
+                self.assertEqual(arrays["depth"].shape, arrays["query_component"].shape)
+                self.assertEqual(arrays["depth"].shape, arrays["provenance_code"].shape)
+
+    def test_slice_expression_and_geometry_are_resident_per_device(self):
+        neighbor = line_geometry().neighbor_index.numpy()
+        expression = np.linspace(
+            0.0, 1.0, 6 * 512, dtype=np.float32
+        ).reshape(6, 512)
+        item = ProNORMSTSlice(
+            slice_id="slice0",
+            role="train",
+            donor="donor0",
+            pair="pair0",
+            barcodes=tuple(f"b{index}" for index in range(6)),
+            gene_ids=tuple(f"g{index}" for index in range(512)),
+            expression_x=expression,
+            expression_z=expression,
+            array_row=np.arange(6, dtype=np.int64),
+            array_col=np.arange(6, dtype=np.int64),
+            full_xy=np.column_stack((np.arange(6), np.zeros(6))).astype(
+                np.float32
+            ),
+            neighbor_index=neighbor,
+            native_scale=1.0,
+            component_id=np.zeros(6, dtype=np.int32),
+        )
+        first_expression = item.expression_z_tensor("cpu")
+        first_geometry = item.geometry("cpu")
+        resident_bytes = item.preload("cpu")
+        self.assertIs(item.expression_z_tensor("cpu"), first_expression)
+        self.assertIs(item.geometry("cpu"), first_geometry)
+        self.assertEqual(len(item._resident_expression_z), 1)
+        self.assertEqual(len(item._resident_geometry), 1)
+        expected_bytes = sum(
+            value.numel() * value.element_size()
+            for value in (
+                first_expression,
+                first_geometry.xy,
+                first_geometry.neighbor_index,
+                first_geometry.native_scale,
+            )
+        )
+        self.assertEqual(resident_bytes, expected_bytes)
+
+    def test_each_optimizer_step_returns_loss_lr_gradient_and_slice_order(self):
+        neighbor = line_geometry().neighbor_index.numpy()
+        expression = np.linspace(0.0, 1.0, 6 * 512, dtype=np.float32).reshape(6, 512)
+        item = ProNORMSTSlice(
+            slice_id="slice0",
+            role="train",
+            donor="donor0",
+            pair="pair0",
+            barcodes=tuple(f"b{index}" for index in range(6)),
+            gene_ids=tuple(f"g{index}" for index in range(512)),
+            expression_x=expression,
+            expression_z=expression,
+            array_row=np.arange(6, dtype=np.int64),
+            array_col=np.arange(6, dtype=np.int64),
+            full_xy=np.column_stack((np.arange(6), np.zeros(6))).astype(np.float32),
+            neighbor_index=neighbor,
+            native_scale=1.0,
+            component_id=np.zeros(6, dtype=np.int32),
+        )
+        data = mock.Mock(
+            roles={"train": [item]},
+            preprocessing=mock.Mock(positive_weight=np.ones(512, dtype=np.float32)),
+        )
+        model = ProNORMST(torch.zeros(512), variant="full")
+        optimizer, _ = optimizer_for_model(model)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        gradient_seen = {name: False for name in model.trainable_parameter_names()}
+        _, _, masks, state = _train_one_epoch(
+            model=model,
+            data=data,
+            geometries={"slice0": build_mask_geometry(neighbor)},
+            optimizer=optimizer,
+            scaler=scaler,
+            data_order_generator=torch.Generator(device="cpu").manual_seed(2027),
+            device=torch.device("cpu"),
+            use_amp=False,
+            protocol="synthetic",
+            fold="fold0",
+            epoch=0,
+            global_step=0,
+            cycles=1,
+            gradient_seen=gradient_seen,
+        )
+        self.assertEqual(len(masks), 2)
+        steps = state["__step_records__"]
+        self.assertEqual([step["family"] for step in steps], ["ordinary", "gap"])
+        for step in steps:
+            self.assertEqual(step["slice_order"], ["slice0"])
+            self.assertTrue(np.isfinite(step["loss"]))
+            self.assertTrue(np.isfinite(step["gradient_norm_preclip"]))
+            self.assertGreater(step["learning_rate"], 0)
+
+    def test_training_batches_four_slices_and_keeps_diagnostic_witness_single(self):
+        items = [
+            synthetic_slice(f"slice-{index}", expression_offset=0.05 * index)
+            for index in range(5)
+        ]
+        data = mock.Mock(
+            roles={"train": items},
+            preprocessing=mock.Mock(
+                positive_weight=np.ones(512, dtype=np.float32)
+            ),
+        )
+        model = ProNORMST(torch.zeros(512), variant="full")
+        optimizer, _ = optimizer_for_model(model)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        gradient_seen = {name: False for name in model.trainable_parameter_names()}
+        _, _, masks, state = _train_one_epoch(
+            model=model,
+            data=data,
+            geometries={
+                item.slice_id: build_mask_geometry(item.neighbor_index)
+                for item in items
+            },
+            optimizer=optimizer,
+            scaler=scaler,
+            data_order_generator=torch.Generator(device="cpu").manual_seed(2027),
+            device=torch.device("cpu"),
+            use_amp=False,
+            protocol="synthetic",
+            fold="fold0",
+            epoch=0,
+            global_step=0,
+            cycles=1,
+            gradient_seen=gradient_seen,
+        )
+        self.assertEqual(len(masks), 10)
+        ordinary, gap = state["__step_records__"]
+        self.assertEqual([len(batch) for batch in ordinary["slice_batches"]], [4, 1])
+        self.assertEqual([len(batch) for batch in gap["slice_batches"]], [1, 4])
+        for step in (ordinary, gap):
+            self.assertEqual(
+                [slice_id for batch in step["slice_batches"] for slice_id in batch],
+                step["slice_order"],
+            )
 
     def test_validation_summary_omits_per_mask_history_without_changing_gate(self):
         item = mock.Mock(slice_id="slice")
@@ -908,6 +1885,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             staging.mkdir()
             (staging / "partial.npz").write_bytes(b"partial")
             model = mock.Mock(variant="one-shot")
+            test_data = mock.Mock(roles={"test": []})
 
             def fake_evaluate(*_args, **kwargs):
                 prediction = (
@@ -930,7 +1908,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             ) as evaluator:
                 first = _run_test_once(
                     model=model,
-                    data=mock.Mock(),
+                    data=test_data,
                     banks={},
                     output_dir=output_dir,
                     device=torch.device("cpu"),
@@ -941,7 +1919,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
                 )
                 second = _run_test_once(
                     model=model,
-                    data=mock.Mock(),
+                    data=test_data,
                     banks={},
                     output_dir=output_dir,
                     device=torch.device("cpu"),
@@ -959,7 +1937,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "do not match"):
                     _run_test_once(
                         model=model,
-                        data=mock.Mock(),
+                        data=test_data,
                         banks={},
                         output_dir=output_dir,
                         device=torch.device("cpu"),
@@ -978,6 +1956,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
             staging = output_dir / ".test_artifacts.tmp"
             artifact_dir = output_dir / "test_artifacts"
             model = mock.Mock(variant="one-shot")
+            test_data = mock.Mock(roles={"test": []})
 
             def fake_evaluate(*_args, **kwargs):
                 prediction = (
@@ -1001,7 +1980,7 @@ class DataAndObjectiveContractTest(unittest.TestCase):
 
             call = dict(
                 model=model,
-                data=mock.Mock(),
+                data=test_data,
                 banks={},
                 output_dir=output_dir,
                 device=torch.device("cpu"),
@@ -1056,6 +2035,100 @@ class DataAndObjectiveContractTest(unittest.TestCase):
         expected = ((element * weights).sum(dim=(0, 1)) / weights.sum(dim=(0, 1))).mean()
         torch.testing.assert_close(actual, expected)
 
+    def test_padded_batch_loss_preserves_equal_slice_weighting(self):
+        prediction = torch.tensor(
+            [
+                [[2.0, 2.0], [0.0, 4.0], [99.0, 99.0]],
+                [[3.0, 1.0], [1.0, 5.0], [2.0, 0.0]],
+            ]
+        )
+        target = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 2.0], [77.0, 77.0]],
+                [[1.0, 0.0], [0.0, 2.0], [1.0, 0.0]],
+            ]
+        )
+        query_valid = torch.tensor([[True, True, False], [True, True, True]])
+        positive_weight = torch.tensor([3.0, 2.0])
+        actual = weighted_gene_smooth_l1_per_item(
+            prediction,
+            target,
+            positive_weight,
+            query_valid,
+        )
+        expected = torch.stack(
+            [
+                weighted_gene_smooth_l1(
+                    prediction[:1, :2],
+                    target[:1, :2],
+                    positive_weight,
+                ),
+                weighted_gene_smooth_l1(
+                    prediction[1:, :3],
+                    target[1:, :3],
+                    positive_weight,
+                ),
+            ]
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual.mean(), expected.mean())
+
+    def test_padded_slice_batch_matches_individual_forward(self):
+        torch.manual_seed(2027)
+        model = ProNORMST(torch.zeros(512), variant="full").eval()
+        items = [
+            synthetic_slice("slice-a", nodes=6),
+            synthetic_slice("slice-b", nodes=7, expression_offset=0.25),
+        ]
+        masks = [
+            generate_ordinary_mask(
+                build_mask_geometry(item.neighbor_index),
+                make_mask_identity(
+                    protocol="synthetic",
+                    fold="fold0",
+                    role="train",
+                    slice_id=item.slice_id,
+                    family="ordinary",
+                    mask_index=0,
+                ),
+            )
+            for item in items
+        ]
+        packed = build_padded_model_batch(
+            items,
+            masks,
+            torch.device("cpu"),
+        )
+        with torch.no_grad():
+            batched = model(
+                packed.visible_z,
+                packed.visible_index,
+                packed.query_index,
+                packed.geometry,
+            )
+            for offset, (item, mask) in enumerate(
+                zip(items, masks, strict=True)
+            ):
+                expression = item.expression_z_tensor("cpu")
+                visible = torch.as_tensor(mask.visible_index, dtype=torch.long)
+                query = torch.as_tensor(mask.query_index, dtype=torch.long)
+                individual = model(
+                    expression.index_select(0, visible).unsqueeze(0),
+                    visible,
+                    query,
+                    item.geometry("cpu"),
+                )
+                torch.testing.assert_close(
+                    batched[offset, : query.numel()],
+                    individual.squeeze(0),
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+        self.assertEqual(
+            packed.geometry.node_mask.sum(dim=1).tolist(),
+            [item.n_nodes for item in items],
+        )
+
     def test_strict_idw_uses_canonical_tie_break_for_six_neighbors(self):
         visible_index = np.arange(7, dtype=np.int64)
         visible_xy = np.array(
@@ -1068,10 +2141,65 @@ class DataAndObjectiveContractTest(unittest.TestCase):
         )
         self.assertLess(float(prediction[0, 0]), 3.5)
 
+    def test_strict_idw_topk_is_exactly_equal_to_full_sort_reference(self):
+        generator = np.random.default_rng(2027)
+
+        def reference(
+            values: np.ndarray,
+            visible_xy: np.ndarray,
+            visible_index: np.ndarray,
+            query_xy: np.ndarray,
+        ) -> np.ndarray:
+            value64 = np.asarray(values, dtype=np.float64)
+            source64 = np.asarray(visible_xy, dtype=np.float64)
+            target64 = np.asarray(query_xy, dtype=np.float64)
+            canonical = np.asarray(visible_index, dtype=np.int64)
+            take = min(6, value64.shape[0])
+            output = np.empty((target64.shape[0], value64.shape[1]), dtype=np.float64)
+            for offset, coordinate in enumerate(target64):
+                distance = np.linalg.norm(source64 - coordinate[None, :], axis=1)
+                order = np.lexsort((canonical, distance))[:take]
+                selected_distance = distance[order]
+                if (selected_distance <= 0).any():
+                    zero = order[selected_distance <= 0]
+                    output[offset] = value64[zero].mean(axis=0)
+                else:
+                    weight = selected_distance ** -2.0
+                    weight /= weight.sum()
+                    output[offset] = weight @ value64[order]
+            return output.astype(np.float32)
+
+        for visible_points in (3, 7, 31):
+            visible_xy = generator.integers(
+                -4, 5, size=(visible_points, 2)
+            ).astype(np.float32)
+            values = generator.normal(size=(visible_points, 17)).astype(np.float32)
+            visible_index = generator.permutation(visible_points).astype(np.int64)
+            query_xy = np.concatenate(
+                [
+                    visible_xy[:1],
+                    generator.integers(-4, 5, size=(12, 2)).astype(np.float32),
+                ],
+                axis=0,
+            )
+            expected = reference(values, visible_xy, visible_index, query_xy)
+            actual = strict_visible_idw(
+                values,
+                visible_xy,
+                visible_index,
+                query_xy,
+            )
+            np.testing.assert_array_equal(actual, expected)
+
     def test_contracted_learning_rate_endpoints(self):
-        self.assertAlmostEqual(learning_rate_for_step(128), 2e-5)
-        self.assertAlmostEqual(learning_rate_for_step(3200), 2e-6)
+        self.assertAlmostEqual(learning_rate_for_step(128), 5e-5)
+        self.assertAlmostEqual(learning_rate_for_step(3200), 5e-6)
         self.assertLess(learning_rate_for_step(1), learning_rate_for_step(2))
+        model = ProNORMST(torch.zeros(512), variant="full")
+        optimizer, _ = optimizer_for_model(model)
+        self.assertTrue(
+            all(group["lr"] == 5e-5 for group in optimizer.param_groups)
+        )
 
     def test_checkpoint_round_trip_and_contract_mismatch(self):
         model = ProNORMST(torch.zeros(512), variant="full")
@@ -1106,6 +2234,30 @@ class DataAndObjectiveContractTest(unittest.TestCase):
                 _load_checkpoint(
                     checkpoint, restored, "different", torch.device("cpu")
                 )
+
+    def test_rng_restore_moves_generator_states_back_to_cpu(self):
+        generator = torch.Generator(device="cpu").manual_seed(2027)
+        state = capture_rng_state(generator)
+        expected_torch_state = state["torch_cpu"]
+        expected_data_order_state = state["data_order"]
+        torch_state_proxy = mock.Mock()
+        torch_state_proxy.cpu.return_value = expected_torch_state
+        data_order_proxy = mock.Mock()
+        data_order_proxy.cpu.return_value = expected_data_order_state
+        state["torch_cpu"] = torch_state_proxy
+        state["torch_cuda"] = None
+        state["data_order"] = data_order_proxy
+
+        restored_generator = torch.Generator(device="cpu")
+        with mock.patch("training.pro_normst_engine.torch.set_rng_state") as setter:
+            restore_rng_state(state, restored_generator)
+
+        setter.assert_called_once_with(expected_torch_state)
+        torch_state_proxy.cpu.assert_called_once_with()
+        data_order_proxy.cpu.assert_called_once_with()
+        torch.testing.assert_close(
+            restored_generator.get_state(), expected_data_order_state
+        )
 
 
 if __name__ == "__main__":

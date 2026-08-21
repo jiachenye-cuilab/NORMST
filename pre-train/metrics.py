@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -191,9 +189,3 @@ class ReconstructionMetrics:
                 self.library_relative_error_sum / self.n_spots
             ),
         }
-
-
-def assert_finite_metrics(metrics: dict) -> None:
-    for key, value in metrics.items():
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError(f"non-finite metric {key}: {value}")

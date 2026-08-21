@@ -108,5 +108,48 @@ python /data/yejiachen/Workdir/NORMST/train.py \
 ### Synthetic validation
 
 ```bash
-python -m unittest discover -s tests
+conda run -n NORMST python -m unittest discover -s tests -v
 ```
+
+### Controlled ProNORMST lifecycle
+
+The supported entry points, compatibility boundaries, and versioned experiment
+modules are summarized in [`ARCHITECTURE.md`](ARCHITECTURE.md). This README
+contains no mutable round status.
+
+Every ProNORMST smoke, pilot, resume and formal run requires one immutable
+`--round-id` and a non-empty `--round-reason`. The run saves
+`round_freeze.json`; a formal LODO test additionally requires the validation-
+selected `run_checkpoint_lock.json`. Pilot health gates create
+`candidate_lock.json` before the one allowed pilot test.
+
+Use the controlled launcher so the physical GPU, command, PID, log and exit
+status are recorded next to (not inside) the non-overwritable run directory:
+
+```bash
+bash scripts/pro_normst_run.sh \
+  --round-id round-001 \
+  --round-reason "frozen baseline candidate" \
+  --manifest pre-train/manifests/random_pair_8_2_2_seed2027.json \
+  --output-dir save/pro_normst/round-001/pilot \
+  --variant full --seed 2027 --physical-gpu 0 --smoke
+```
+
+After a passed pilot and completed 36-run LODO matrix, create the immutable
+matrix manifest and run formal acceptance:
+
+```bash
+conda run -n NORMST python -m training.pro_normst_matrix \
+  --round-id round-001 \
+  --runs-root save/pro_normst \
+  --output save/pro_normst/round-001/formal_matrix.json \
+  --require-complete
+
+conda run -n NORMST python -m training.pro_normst_acceptance \
+  --matrix save/pro_normst/round-001/formal_matrix.json \
+  --output-dir save/pro_normst/round-001/acceptance
+```
+
+Formal acceptance atomically publishes the acceptance decision, fold×seed
+effects, all required raw-`x` scientific summaries, paired control gains,
+supported-gene summaries and depth/degree/component/provenance strata.

@@ -10,6 +10,7 @@ env/
 
 # Test and tooling caches
 .pytest_cache/
+.cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -32,3 +33,11 @@ wandb/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local agent/session governance and server-specific launch inputs
+AGENTS.md
+GOAL_OBJECTIVE.md
+PRO_NORMST_SESSION_HANDOFF.md
+Pro_contract.md
+pre-train/manifests/*_server_absolute.json
+train_f1_ae_genes.sh

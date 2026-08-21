@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -106,21 +106,75 @@ class ProNORMSTSlice:
     source_barcodes_sha256: str = ""
     source_gex_gene_ids_sha256: str = ""
     source_panel_indices_sha256: str = ""
+    _resident_expression_z: dict[str, torch.Tensor] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _resident_geometry: dict[str, FullHexGeometry] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def n_nodes(self) -> int:
         return len(self.barcodes)
 
-    def geometry(self, device: torch.device | str = "cpu") -> FullHexGeometry:
+    @staticmethod
+    def _device_key(device: torch.device | str) -> tuple[torch.device, str]:
         target = torch.device(device)
-        return FullHexGeometry(
-            xy=torch.as_tensor(self.full_xy, dtype=torch.float32, device=target),
-            neighbor_index=torch.as_tensor(
-                self.neighbor_index, dtype=torch.long, device=target
-            ),
-            native_scale=torch.tensor(self.native_scale, dtype=torch.float32, device=target),
-            indices_validated=True,
-        )
+        if target.type == "cuda" and target.index is None:
+            target = torch.device("cuda", torch.cuda.current_device())
+        return target, str(target)
+
+    def expression_z_tensor(
+        self,
+        device: torch.device | str = "cpu",
+    ) -> torch.Tensor:
+        """Return one immutable full-slice z tensor resident on ``device``."""
+        target, key = self._device_key(device)
+        value = self._resident_expression_z.get(key)
+        if value is None:
+            value = torch.as_tensor(
+                self.expression_z,
+                dtype=torch.float32,
+                device=target,
+            )
+            self._resident_expression_z[key] = value
+        return value
+
+    def geometry(self, device: torch.device | str = "cpu") -> FullHexGeometry:
+        target, key = self._device_key(device)
+        value = self._resident_geometry.get(key)
+        if value is None:
+            value = FullHexGeometry(
+                xy=torch.as_tensor(self.full_xy, dtype=torch.float32, device=target),
+                neighbor_index=torch.as_tensor(
+                    self.neighbor_index, dtype=torch.long, device=target
+                ),
+                native_scale=torch.tensor(
+                    self.native_scale,
+                    dtype=torch.float32,
+                    device=target,
+                ),
+                indices_validated=True,
+            )
+            self._resident_geometry[key] = value
+        return value
+
+    def preload(self, device: torch.device | str) -> int:
+        """Materialize expression/geometry once and return their resident bytes."""
+        expression = self.expression_z_tensor(device)
+        geometry = self.geometry(device)
+        tensors = [expression, geometry.xy, geometry.neighbor_index]
+        if geometry.node_mask is not None:
+            tensors.append(geometry.node_mask)
+        if geometry.native_scale is not None:
+            tensors.append(geometry.native_scale)
+        return sum(value.numel() * value.element_size() for value in tensors)
 
 
 @dataclass(frozen=True)

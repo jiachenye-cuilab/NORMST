@@ -7,7 +7,8 @@ Examples::
 
     python train.py --task visium --model pro-normst \
       --manifest pre-train/manifests/random_pair_8_2_2_seed2027.json \
-      --output-dir save/pro_normst/pilot2027 --seed 2027
+      --output-dir save/pro_normst/round-001/pilot2027 --seed 2027 \
+      --round-id round-001 --round-reason "frozen baseline candidate"
 
     python train.py --task visium_hd \
       --lr-dir /data/square_016um --hr-dir /data/square_008um \

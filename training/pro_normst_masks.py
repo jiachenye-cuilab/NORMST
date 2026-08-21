@@ -56,6 +56,8 @@ class ProMask:
             "n_query": int(self.query_index.size),
             "realized_fraction": self.realized_fraction,
             "query_index": self.query_index.tolist(),
+            "visible_index": self.visible_index.tolist(),
+            "provenance": self.provenance.tolist(),
             "provenance_counts": counts,
             "hole_sizes": [len(hole.nodes) for hole in self.holes],
             "holes": [

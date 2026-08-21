@@ -24,6 +24,114 @@ from .progressive_normst import (
 ProNORMSTVariant = Literal["full", "one-shot", "local-only", "global-only"]
 
 
+class ResidualGeneProgramEncoder(nn.Module):
+    """Zero-start residual MLP used only by the global visible memory."""
+
+    def __init__(
+        self,
+        state_dim: int = 512,
+        hidden_dim: int = 256,
+        norm_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if min(state_dim, hidden_dim) < 1:
+            raise ValueError("gene-program encoder dimensions must be positive")
+        self.state_dim = int(state_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_norm = NonAffineRMSNorm(self.state_dim, eps=norm_eps)
+        self.input_projection = nn.Linear(self.state_dim, self.hidden_dim)
+        self.activation = nn.GELU()
+        self.output_projection = nn.Linear(self.hidden_dim, self.state_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, visible_state: torch.Tensor) -> torch.Tensor:
+        residual = self.output_projection(
+            self.activation(self.input_projection(self.input_norm(visible_state)))
+        )
+        return visible_state + residual
+
+
+class ResidualLocalStateEnhancer(nn.Module):
+    """Zero-start residual MLP applied after local aggregation."""
+
+    def __init__(
+        self,
+        state_dim: int = 512,
+        hidden_dim: int = 256,
+        norm_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if min(state_dim, hidden_dim) < 1:
+            raise ValueError("local-state enhancer dimensions must be positive")
+        self.state_dim = int(state_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_norm = NonAffineRMSNorm(self.state_dim, eps=norm_eps)
+        self.input_projection = nn.Linear(self.state_dim, self.hidden_dim)
+        self.activation = nn.GELU()
+        self.output_projection = nn.Linear(self.hidden_dim, self.state_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(
+        self,
+        local_state: torch.Tensor,
+        global_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del global_context
+        residual = self.output_projection(
+            self.activation(self.input_projection(self.input_norm(local_state)))
+        )
+        return local_state + residual
+
+
+class GlobalConditionedResidualLocalStateEnhancer(nn.Module):
+    """Zero-start local innovation MLP conditioned on detached global context."""
+
+    def __init__(
+        self,
+        state_dim: int = 512,
+        global_dim: int = 256,
+        hidden_dim: int = 256,
+        norm_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if min(state_dim, global_dim, hidden_dim) < 1:
+            raise ValueError("conditioned local enhancer dimensions must be positive")
+        self.state_dim = int(state_dim)
+        self.global_dim = int(global_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_norm = NonAffineRMSNorm(self.state_dim, eps=norm_eps)
+        self.input_projection = nn.Linear(
+            self.state_dim + self.global_dim,
+            self.hidden_dim,
+        )
+        self.activation = nn.GELU()
+        self.output_projection = nn.Linear(self.hidden_dim, self.state_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(
+        self,
+        local_state: torch.Tensor,
+        global_context: torch.Tensor,
+    ) -> torch.Tensor:
+        if local_state.shape[:-1] != global_context.shape[:-1]:
+            raise ValueError("local state and global context must align")
+        if local_state.shape[-1] != self.state_dim:
+            raise ValueError("local state has an incompatible channel dimension")
+        if global_context.shape[-1] != self.global_dim:
+            raise ValueError("global context has an incompatible channel dimension")
+        conditioned_input = torch.cat(
+            [self.input_norm(local_state), global_context.detach()],
+            dim=-1,
+        )
+        residual = self.output_projection(
+            self.activation(self.input_projection(conditioned_input))
+        )
+        return local_state + residual
+
+
 def _expand_index(
     index: torch.Tensor,
     batch: int,
@@ -57,6 +165,10 @@ class ProNORMST(nn.Module):
     """Shared-512 input/output model with no AE or query-expression input."""
 
     N_GENES = 512
+    GLOBAL_INPUT_HIDDEN_DIM = 256
+    LOCAL_STATE_HIDDEN_DIM = 256
+    LOCAL_DIRECTION_INIT_STD = 1e-3
+    LOCAL_ROUTING_INIT_STD = 1e-3
     VALID_VARIANTS = ("full", "one-shot", "local-only", "global-only")
 
     def __init__(
@@ -108,6 +220,8 @@ class ProNORMST(nn.Module):
             hidden_dim=local_hidden_dim,
             source_type_dim=source_type_dim,
             gamma=gamma,
+            direction_init_std=self.LOCAL_DIRECTION_INIT_STD,
+            routing_init_std=self.LOCAL_ROUTING_INIT_STD,
         )
         self.local_projection = nn.Linear(self.state_dim, self.width, bias=False)
         self.local_norm = NonAffineRMSNorm(self.width, eps=norm_eps)
@@ -119,17 +233,41 @@ class ProNORMST(nn.Module):
         nn.init.normal_(self.gene_decoder[-1].weight, mean=0.0, std=1e-3)
         with torch.no_grad():
             self.gene_decoder[-1].bias.copy_(mean)
-
+        # Register new modules after all Round3 modules so the original seeded
+        # initialization remains unchanged.  Both residual output projections
+        # start at zero, making the initial Round8 forward exactly match the
+        # zero-start Round7/Round5 forward while adding only new conditioning.
+        self.global_input_encoder = ResidualGeneProgramEncoder(
+            state_dim=self.state_dim,
+            hidden_dim=self.GLOBAL_INPUT_HIDDEN_DIM,
+            norm_eps=norm_eps,
+        )
+        self.local_state_enhancer = GlobalConditionedResidualLocalStateEnhancer(
+            state_dim=self.state_dim,
+            global_dim=self.width,
+            hidden_dim=self.LOCAL_STATE_HIDDEN_DIM,
+            norm_eps=norm_eps,
+        )
         if self.variant == "local-only":
             self.global_branch.requires_grad_(False)
+            self.global_input_encoder.requires_grad_(False)
         elif self.variant == "global-only":
             self.local_operator.requires_grad_(False)
+            self.local_state_enhancer.requires_grad_(False)
             self.local_projection.requires_grad_(False)
 
     def contract_manifest(self) -> dict[str, object]:
         """Return the immutable model-side contract for checkpoints."""
-        return {
-            "schema": "pro-normst-direct-512-v1",
+        conditioned_enhancer = isinstance(
+            self.local_state_enhancer,
+            GlobalConditionedResidualLocalStateEnhancer,
+        )
+        manifest: dict[str, object] = {
+            "schema": (
+                "pro-normst-direct-512-v6"
+                if conditioned_enhancer
+                else "pro-normst-direct-512-v5"
+            ),
             "variant": self.variant,
             "n_genes": self.N_GENES,
             "state_dim": self.state_dim,
@@ -144,7 +282,35 @@ class ProNORMST(nn.Module):
             "gamma": self.local_operator.gamma,
             "norm_eps": self.global_branch.output_norm.eps,
             "path_reliability_eps": self.local_operator.reliability_eps,
-            "direct_expression_adapter": "identity_no_parameters",
+            "local_direction_init_std": self.local_operator.direction_init_std,
+            "local_routing_init_std": self.local_operator.routing_init_std,
+            "direct_expression_adapter": (
+                "global_conditioned_residual_mlp_local_residual_mlp_global"
+                if conditioned_enhancer
+                else "residual_mlp_local_residual_mlp_global"
+            ),
+            "global_input_encoder": "residual-prenorm-gene-mlp-v1",
+            "global_input_encoder_hidden_dim": self.global_input_encoder.hidden_dim,
+            "global_input_encoder_output_init": "zeros",
+            "local_state_enhancer": (
+                "global-conditioned-residual-prenorm-local-mlp-v1"
+                if conditioned_enhancer
+                else "residual-prenorm-local-mlp-v1"
+            ),
+            "local_state_enhancer_hidden_dim": self.local_state_enhancer.hidden_dim,
+            "local_state_enhancer_input_dim": (
+                self.local_state_enhancer.state_dim
+                + (
+                    self.local_state_enhancer.global_dim
+                    if conditioned_enhancer
+                    else 0
+                )
+            ),
+            "local_state_enhancer_output_init": "zeros",
+            "local_state_enhancer_position": (
+                "after_local_aggregation_before_local_projection"
+            ),
+            "local_state_enhancer_activation_grouped": True,
             "ae_encoder": False,
             "ae_decoder": False,
             "query_truth_in_forward": False,
@@ -152,7 +318,21 @@ class ProNORMST(nn.Module):
             "synchronous_frontier": True,
             "confidence_metadata_detached": True,
             "gate_parameters": False,
+            "local_fusion_gate": "active_x_coverage_x_confidence_fixed",
         }
+        if conditioned_enhancer:
+            manifest.update(
+                {
+                    "local_state_enhancer_global_condition_dim": (
+                        self.local_state_enhancer.global_dim
+                    ),
+                    "local_state_enhancer_global_condition_source": (
+                        "fixed_original_visible_global_context"
+                    ),
+                    "local_state_enhancer_global_condition_stop_gradient": True,
+                }
+            )
+        return manifest
 
     def trainable_parameter_names(self) -> tuple[str, ...]:
         return tuple(name for name, parameter in self.named_parameters() if parameter.requires_grad)
@@ -272,8 +452,10 @@ class ProNORMST(nn.Module):
 
         need_global = self.variant != "local-only"
         if need_global:
+            global_input_state = self.global_input_encoder(visible_state)
+            global_input_residual = global_input_state - visible_state
             global_raw, global_normalized, global_diagnostics = self.global_branch(
-                visible_state,
+                global_input_state,
                 visible_xy,
                 query_xy,
                 materialized["native_scale"],
@@ -282,6 +464,8 @@ class ProNORMST(nn.Module):
                 return_diagnostics=return_diagnostics,
             )
         else:
+            global_input_state = visible_state
+            global_input_residual = torch.zeros_like(visible_state)
             global_raw = visible_state.new_zeros(batch, query_points, self.width)
             global_normalized = torch.zeros_like(global_raw)
             global_diagnostics = {}
@@ -304,29 +488,85 @@ class ProNORMST(nn.Module):
                 local_result["active"][..., None], query_index, query_valid
             ).squeeze(-1).to(torch.bool)
             active_query = active_query & query_valid
+            activation_round = _gather_nodes(
+                local_result["activation_round"][..., None], query_index, query_valid
+            ).squeeze(-1).to(torch.long)
+            activation_round = torch.where(
+                query_valid, activation_round, torch.full_like(activation_round, -1)
+            )
             flat_active = active_query.reshape(-1)
-            active_offset = torch.nonzero(flat_active, as_tuple=False).squeeze(-1)
+            flat_activation_round = activation_round.reshape(-1)
             flat_state = local_state.reshape(-1, self.state_dim)
-            if active_offset.numel() > 0:
-                projected_active = self.local_projection(
-                    flat_state.index_select(0, active_offset)
+            flat_global_context = global_normalized.reshape(-1, self.width)
+            flat_enhanced = None
+            flat_enhancer_residual = None
+            flat_projected = None
+            flat_normalized = None
+            # Keep each activation depth's GEMM row shape independent of the
+            # requested early-exit limit.  Under FP16, projecting all active
+            # rows at once lets cuBLAS choose shape-dependent rounding, which
+            # can change depth-1/2 predictions between round limits.
+            for activation in range(1, rounds + 1):
+                round_offset = torch.nonzero(
+                    flat_active & (flat_activation_round == activation),
+                    as_tuple=False,
+                ).squeeze(-1)
+                if round_offset.numel() < 1:
+                    continue
+                state_round = flat_state.index_select(0, round_offset)
+                global_context_round = flat_global_context.index_select(
+                    0, round_offset
                 )
-                normalized_active = self.local_norm(projected_active)
-                flat_projected = projected_active.new_zeros(
-                    flat_state.shape[0], self.width
+                enhanced_round = self.local_state_enhancer(
+                    state_round,
+                    global_context_round,
                 )
-                flat_normalized = torch.zeros_like(flat_projected)
+                enhancer_residual_round = enhanced_round - state_round
+                projected_round = self.local_projection(
+                    enhanced_round
+                )
+                normalized_round = self.local_norm(projected_round)
+                if flat_projected is None:
+                    flat_enhanced = enhanced_round.new_zeros(
+                        flat_state.shape[0], self.state_dim
+                    )
+                    flat_enhancer_residual = torch.zeros_like(flat_enhanced)
+                    flat_projected = projected_round.new_zeros(
+                        flat_state.shape[0], self.width
+                    )
+                    flat_normalized = torch.zeros_like(flat_projected)
+                flat_enhanced = flat_enhanced.index_copy(
+                    0, round_offset, enhanced_round
+                )
+                flat_enhancer_residual = flat_enhancer_residual.index_copy(
+                    0, round_offset, enhancer_residual_round
+                )
                 flat_projected = flat_projected.index_copy(
-                    0, active_offset, projected_active
+                    0, round_offset, projected_round
                 )
                 flat_normalized = flat_normalized.index_copy(
-                    0, active_offset, normalized_active
+                    0, round_offset, normalized_round
                 )
-            else:
+            if (
+                flat_enhanced is None
+                or flat_enhancer_residual is None
+                or flat_projected is None
+                or flat_normalized is None
+            ):
+                flat_enhanced = local_state.new_zeros(
+                    flat_state.shape[0], self.state_dim
+                )
+                flat_enhancer_residual = torch.zeros_like(flat_enhanced)
                 flat_projected = local_state.new_zeros(
                     flat_state.shape[0], self.width
                 )
                 flat_normalized = torch.zeros_like(flat_projected)
+            local_state_enhanced = flat_enhanced.reshape(
+                batch, query_points, self.state_dim
+            )
+            local_state_residual = flat_enhancer_residual.reshape(
+                batch, query_points, self.state_dim
+            )
             local_projected = flat_projected.reshape(
                 batch, query_points, self.width
             )
@@ -335,13 +575,23 @@ class ProNORMST(nn.Module):
             )
             query_gate = _gather_nodes(
                 local_result["gate"][..., None], query_index, query_valid
-            )
+            ).detach()
+            query_confidence = _gather_nodes(
+                local_result["confidence"][..., None], query_index, query_valid
+            ).detach()
+            query_coverage = _gather_nodes(
+                local_result["coverage"][..., None], query_index, query_valid
+            ).detach()
             gated_local = query_gate * local_normalized
         else:
             local_state = visible_state.new_zeros(batch, query_points, self.state_dim)
+            local_state_enhanced = torch.zeros_like(local_state)
+            local_state_residual = torch.zeros_like(local_state)
             local_projected = visible_state.new_zeros(batch, query_points, self.width)
             local_normalized = torch.zeros_like(local_projected)
             query_gate = visible_state.new_zeros(batch, query_points, 1)
+            query_confidence = visible_state.new_zeros(batch, query_points, 1)
+            query_coverage = torch.zeros_like(query_confidence)
             gated_local = torch.zeros_like(local_projected)
             local_result = {
                 "active": query_nodes.new_zeros(query_nodes.shape),
@@ -355,6 +605,7 @@ class ProNORMST(nn.Module):
                 "state": initial_state,
             }
             active_query = query_valid.new_zeros(query_valid.shape)
+            activation_round = torch.full_like(query_valid, -1, dtype=torch.long)
 
         fused = torch.cat([global_normalized, gated_local], dim=-1)
         prediction = self.gene_decoder(fused)
@@ -362,17 +613,13 @@ class ProNORMST(nn.Module):
         if not return_auxiliary and not return_diagnostics:
             return prediction
 
-        activation_round = _gather_nodes(
-            local_result["activation_round"][..., None], query_index, query_valid
-        ).squeeze(-1).to(torch.long)
-        activation_round = torch.where(
-            query_valid, activation_round, torch.full_like(activation_round, -1)
-        )
         auxiliary: dict[str, object] = {
             "visible_state": visible_state,
             "global_raw": global_raw,
             "global_normalized": global_normalized,
             "local_state": local_state,
+            "local_state_enhanced": local_state_enhanced,
+            "local_state_residual": local_state_residual,
             "local_projected": local_projected,
             "local_normalized": local_normalized,
             "gate": query_gate,
@@ -380,12 +627,11 @@ class ProNORMST(nn.Module):
             "fused_feature": fused,
             "active_query": active_query,
             "activation_round": activation_round,
-            "confidence": _gather_nodes(
-                local_result["confidence"][..., None], query_index, query_valid
-            ),
-            "coverage": _gather_nodes(
-                local_result["coverage"][..., None], query_index, query_valid
-            ),
+            "confidence": query_confidence,
+            "coverage": query_coverage,
+            "global_input_base": visible_state,
+            "global_input_state": global_input_state,
+            "global_input_residual": global_input_residual,
             "frontier_masks": local_result["frontier_masks"],
             "routing_probability": local_result["routing_probability"],
             "native_scale": materialized["native_scale"],
@@ -411,4 +657,11 @@ class ProNORMST(nn.Module):
         return prediction, auxiliary
 
 
-__all__ = ["FullHexGeometry", "ProNORMST", "ProNORMSTVariant"]
+__all__ = [
+    "FullHexGeometry",
+    "GlobalConditionedResidualLocalStateEnhancer",
+    "ProNORMST",
+    "ProNORMSTVariant",
+    "ResidualLocalStateEnhancer",
+    "ResidualGeneProgramEncoder",
+]

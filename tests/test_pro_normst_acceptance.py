@@ -17,12 +17,15 @@ from training.pro_normst_acceptance import (
     ROUND_INVARIANCE_ATOL,
     SEEDS,
     VARIANTS,
+    _load_run,
     _prediction_tree_sha256,
     _round_invariance,
     load_formal_matrix,
     summarize_formal_matrix,
     write_formal_acceptance,
 )
+from training.pro_normst_engine import file_sha256
+from training.pro_normst_matrix import build_formal_matrix, write_formal_matrix
 
 
 def _family_summary(model: float, idw: float, depth2: float, depth34: float):
@@ -129,7 +132,11 @@ def _formal_contract(fold: str):
 def _loaded_runs():
     runs = _runs()
     for (fold, _seed, variant), run in runs.items():
-        run["config"] = {"variant": variant}
+        run["config"] = {
+            "variant": variant,
+            "round_identity": "round-001",
+            "human_contract_version": "pro-normst-human-v9",
+        }
         run["contract"] = copy.deepcopy(_formal_contract(fold))
         run["metrics"]["_meta"] = {
             "test_expression_x_sha256": {f"{fold}-test": f"test-expression-{fold}"}
@@ -140,6 +147,7 @@ def _loaded_runs():
 def _formal_matrix_payload():
     return {
         "schema": "pro-normst-formal-matrix-v1",
+        "round_identity": "round-001",
         "runs": [
             {
                 "fold": fold,
@@ -184,6 +192,101 @@ def _runs_with_round_predictions(root: Path) -> dict[tuple[str, int, str], dict[
 
 
 class FormalAcceptanceTest(unittest.TestCase):
+    def test_load_run_requires_pretest_checkpoint_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            test_dir = run_dir / "test_artifacts"
+            prediction = (
+                test_dir
+                / "predictions"
+                / "test_round4"
+                / "slice"
+                / "gap"
+                / "mask_00.npz"
+            )
+            prediction.parent.mkdir(parents=True)
+            np.savez(prediction, prediction_x=np.ones((1, 1), dtype=np.float32))
+            config = {
+                "model": "pro-normst",
+                "evidence_tier": "formal-lodo",
+                "protocol": "pair_grouped_lodo",
+                "fold": "lodo_d1",
+                "initialization_seed": 2027,
+                "variant": "global-only",
+                "candidate_lock": "portable.json",
+                "contract_hash": "contract",
+                "human_contract_version": "pro-normst-human-v9",
+                "round_identity": "round-001",
+            }
+            contract = {"run": {"candidate_lock_sha256": "candidate"}}
+            metrics = {"_meta": {"contract_hash": "contract"}, "round4": {}}
+            status = {"status": "complete", "test_run": True}
+            checkpoint_lock = {
+                "schema": "pro-normst-run-checkpoint-lock-v1",
+                "status": "locked",
+                "human_contract_version": "pro-normst-human-v9",
+                "round_identity": "round-001",
+                "fold": "lodo_d1",
+                "initialization_seed": 2027,
+                "variant": "global-only",
+                "contract_hash": "contract",
+                "checkpoint_sha256": "checkpoint",
+            }
+            artifacts = {
+                run_dir / "config.json": config,
+                run_dir / "contract_manifest.json": contract,
+                run_dir / "run_status.json": status,
+                run_dir / "gradient_gate.json": {"passed": True},
+                run_dir / "final_loss_bptt_gate.json": {"passed": True},
+                run_dir / "run_checkpoint_lock.json": checkpoint_lock,
+                test_dir / "test_metrics.json": metrics,
+            }
+            for path, payload in artifacts.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            complete = {
+                "status": "complete",
+                "checkpoint_sha256": "checkpoint",
+                "contract_hash": "contract",
+                "test_metrics_sha256": file_sha256(test_dir / "test_metrics.json"),
+                "prediction_tree_sha256": _prediction_tree_sha256(
+                    test_dir / "predictions"
+                ),
+                "run_checkpoint_lock_sha256": file_sha256(
+                    run_dir / "run_checkpoint_lock.json"
+                ),
+            }
+            (test_dir / "test_complete.json").write_text(
+                json.dumps(complete), encoding="utf-8"
+            )
+            loaded = _load_run(run_dir, ("lodo_d1", 2027, "global-only"))
+            self.assertEqual(loaded["checkpoint_lock"]["status"], "locked")
+            checkpoint_lock["checkpoint_sha256"] = "changed"
+            (run_dir / "run_checkpoint_lock.json").write_text(
+                json.dumps(checkpoint_lock), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint lock"):
+                _load_run(run_dir, ("lodo_d1", 2027, "global-only"))
+
+    def test_formal_matrix_generator_freezes_all_36_run_identities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = build_formal_matrix("round-001", root / "runs")
+            self.assertEqual(payload["round_identity"], "round-001")
+            self.assertEqual(len(payload["runs"]), 36)
+            identities = {
+                (entry["fold"], entry["seed"], entry["variant"])
+                for entry in payload["runs"]
+            }
+            self.assertEqual(len(identities), 36)
+            output = root / "formal_matrix.json"
+            write_formal_matrix(payload, output)
+            write_formal_matrix(payload, output)
+            changed = copy.deepcopy(payload)
+            changed["round_identity"] = "round-002"
+            with self.assertRaisesRegex(FileExistsError, "replace"):
+                write_formal_matrix(changed, output)
+
     @mock.patch(
         "training.pro_normst_acceptance._round_invariance",
         return_value={"passed": True, "comparisons": 1, "mismatches": []},
@@ -378,7 +481,12 @@ class FormalAcceptanceTest(unittest.TestCase):
             artifact_dir = destination / FORMAL_ARTIFACTS_DIRECTORY
             self.assertEqual(
                 {path.name for path in artifact_dir.iterdir()},
-                {"formal_acceptance.json", "formal_run_effects.csv"},
+                {
+                    "formal_acceptance.json",
+                    "formal_run_effects.csv",
+                    "formal_scientific_metrics.csv",
+                    "formal_paired_metrics.csv",
+                },
             )
             write_formal_acceptance(result, destination)
             self.assertEqual(readme.read_text(encoding="utf-8"), "do not touch\n")

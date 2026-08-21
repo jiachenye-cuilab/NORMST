@@ -25,6 +25,32 @@ DEPTH_ACCEPTANCE_FAMILY = "gap"
 ROUND_INVARIANCE_RTOL = 2e-3
 ROUND_INVARIANCE_ATOL = 2e-4
 FORMAL_ARTIFACTS_DIRECTORY = "formal_artifacts"
+SCIENTIFIC_METRICS = (
+    "smooth_l1",
+    "mae",
+    "rmse",
+    "gene_pearson",
+    "spot_pearson",
+    "variance_ratio_median",
+    "variance_ratio_q25",
+    "variance_ratio_q75",
+    "variance_ratio_defined",
+    "negative_fraction",
+    "positive_mae",
+    "positive_rmse",
+    "zero_mae",
+    "zero_rmse",
+)
+PAIRED_ERROR_METRICS = (
+    "smooth_l1",
+    "mae",
+    "rmse",
+    "positive_mae",
+    "positive_rmse",
+    "zero_mae",
+    "zero_rmse",
+)
+PAIRED_CORRELATION_METRICS = ("gene_pearson", "spot_pearson")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -55,6 +81,8 @@ def _load_run(run_dir: Path, identity: tuple[str, int, str]) -> dict[str, Any]:
     contract = _read_json(run_dir / "contract_manifest.json")
     metrics = _read_json(test_artifacts / "test_metrics.json")
     complete = _read_json(test_artifacts / "test_complete.json")
+    checkpoint_lock_path = run_dir / "run_checkpoint_lock.json"
+    checkpoint_lock = _read_json(checkpoint_lock_path)
     status = _read_json(run_dir / "run_status.json")
     gradient = _read_json(run_dir / "gradient_gate.json")
     bptt = _read_json(run_dir / "final_loss_bptt_gate.json")
@@ -75,6 +103,24 @@ def _load_run(run_dir: Path, identity: tuple[str, int, str]) -> dict[str, Any]:
         raise ValueError(f"{run_dir}: formal test is incomplete")
     if complete.get("status") != "complete":
         raise ValueError(f"{run_dir}: test completion marker is invalid")
+    if (
+        checkpoint_lock.get("schema") != "pro-normst-run-checkpoint-lock-v1"
+        or checkpoint_lock.get("status") != "locked"
+        or checkpoint_lock.get("contract_hash") != config.get("contract_hash")
+        or checkpoint_lock.get("checkpoint_sha256") != complete.get("checkpoint_sha256")
+        or complete.get("run_checkpoint_lock_sha256")
+        != file_sha256(checkpoint_lock_path)
+    ):
+        raise ValueError(f"{run_dir}: formal run checkpoint lock is invalid")
+    lock_identity = {
+        "human_contract_version": config.get("human_contract_version"),
+        "round_identity": config.get("round_identity"),
+        "fold": fold,
+        "initialization_seed": seed,
+        "variant": variant,
+    }
+    if any(checkpoint_lock.get(key) != value for key, value in lock_identity.items()):
+        raise ValueError(f"{run_dir}: formal run checkpoint lock identity drifted")
     if gradient.get("passed") is not True or bptt.get("passed") is not True:
         raise ValueError(f"{run_dir}: gradient/BPTT gate failed")
     contract_hash = config.get("contract_hash")
@@ -103,6 +149,7 @@ def _load_run(run_dir: Path, identity: tuple[str, int, str]) -> dict[str, Any]:
         "contract": contract,
         "metrics": metrics,
         "complete": complete,
+        "checkpoint_lock": checkpoint_lock,
         "gradient": gradient,
         "bptt": bptt,
     }
@@ -168,6 +215,9 @@ def load_formal_matrix(path: str | Path) -> dict[tuple[str, int, str], dict[str,
     payload = _read_json(matrix_path)
     if payload.get("schema") != "pro-normst-formal-matrix-v1":
         raise ValueError("formal matrix schema is incompatible")
+    round_identity = payload.get("round_identity")
+    if not isinstance(round_identity, str) or not round_identity:
+        raise ValueError("formal matrix round identity is missing")
     entries = payload.get("runs")
     if not isinstance(entries, list):
         raise ValueError("formal matrix runs must be a list")
@@ -194,6 +244,14 @@ def load_formal_matrix(path: str | Path) -> dict[tuple[str, int, str], dict[str,
     }
     if None in candidate_lock_hashes or len(candidate_lock_hashes) != 1:
         raise ValueError("formal runs do not share one frozen candidate lock")
+    run_rounds = {run["config"].get("round_identity") for run in runs.values()}
+    human_versions = {
+        run["config"].get("human_contract_version") for run in runs.values()
+    }
+    if run_rounds != {round_identity}:
+        raise ValueError("formal runs do not share the matrix round identity")
+    if human_versions != {"pro-normst-human-v9"}:
+        raise ValueError("formal runs do not share the frozen human contract version")
 
     for fold in FOLDS:
         fold_runs = [run for identity, run in runs.items() if identity[0] == fold]
@@ -288,6 +346,228 @@ def _effect_summary(values: dict[tuple[str, int], float]) -> dict[str, Any]:
     }
 
 
+def _descriptive_summary(
+    values: dict[tuple[str, int], float | int | None],
+) -> dict[str, Any]:
+    """Summarize possibly undefined metrics without treating runs as donors."""
+
+    expected = {(fold, seed) for fold in FOLDS for seed in SEEDS}
+    if set(values) != expected:
+        raise ValueError("descriptive metric does not contain all fold x seed identities")
+    rows = []
+    fold_effect: dict[str, float | None] = {}
+    for fold in FOLDS:
+        fold_values = []
+        for seed in SEEDS:
+            raw = values[(fold, seed)]
+            value = (
+                float(raw)
+                if isinstance(raw, (int, float))
+                and not isinstance(raw, bool)
+                and math.isfinite(float(raw))
+                else None
+            )
+            rows.append({"fold": fold, "seed": seed, "value": value})
+            if value is not None:
+                fold_values.append(value)
+        fold_effect[fold] = float(np.mean(fold_values)) if fold_values else None
+    defined_folds = [
+        float(fold_effect[fold])
+        for fold in FOLDS
+        if fold_effect[fold] is not None
+    ]
+    return {
+        "fold_x_init": rows,
+        "fold_effect": fold_effect,
+        "overall_mean": float(np.mean(defined_folds)) if defined_folds else None,
+        "fold_sample_sd": (
+            float(np.std(defined_folds, ddof=1)) if len(defined_folds) >= 2 else None
+        ),
+        "fold_range": (
+            [float(np.min(defined_folds)), float(np.max(defined_folds))]
+            if defined_folds
+            else None
+        ),
+        "defined_runs": sum(row["value"] is not None for row in rows),
+        "defined_folds": len(defined_folds),
+    }
+
+
+def _primary_round(variant: str) -> int:
+    return 1 if variant == "one-shot" else 4
+
+
+def _summary_section(
+    run: dict[str, Any],
+    variant: str,
+    family: str,
+    section: str,
+) -> dict[str, Any]:
+    summary = run["metrics"][f"round{_primary_round(variant)}"]["families"][family][
+        "summary"
+    ]
+    value = summary.get(section, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _scientific_report(
+    runs: dict[tuple[str, int, str], dict[str, Any]],
+) -> dict[str, Any]:
+    methods: dict[str, Any] = {}
+    for variant in VARIANTS:
+        methods[variant] = {}
+        for family in ("ordinary", "gap"):
+            methods[variant][family] = {
+                metric: _descriptive_summary(
+                    {
+                        (fold, seed): _summary_section(
+                            runs[(fold, seed, variant)], variant, family, "model"
+                        ).get(metric)
+                        for fold in FOLDS
+                        for seed in SEEDS
+                    }
+                )
+                for metric in SCIENTIFIC_METRICS
+            }
+
+    strict_idw: dict[str, Any] = {}
+    clipped_secondary: dict[str, Any] = {}
+    for family in ("ordinary", "gap"):
+        strict_idw[family] = {
+            metric: _descriptive_summary(
+                {
+                    (fold, seed): _summary_section(
+                        runs[(fold, seed, "full")], "full", family, "idw"
+                    ).get(metric)
+                    for fold in FOLDS
+                    for seed in SEEDS
+                }
+            )
+            for metric in SCIENTIFIC_METRICS
+        }
+        clipped_secondary[family] = {
+            metric: _descriptive_summary(
+                {
+                    (fold, seed): _summary_section(
+                        runs[(fold, seed, "full")],
+                        "full",
+                        family,
+                        "model_clipped_zero",
+                    ).get(metric)
+                    for fold in FOLDS
+                    for seed in SEEDS
+                }
+            )
+            for metric in SCIENTIFIC_METRICS
+        }
+
+    controls = {
+        "full_vs_idw": "idw",
+        "full_vs_one_shot": "one-shot",
+        "full_vs_local_only": "local-only",
+        "full_vs_global_only": "global-only",
+    }
+    paired: dict[str, Any] = {}
+    for comparison, control in controls.items():
+        paired[comparison] = {}
+        for family in ("ordinary", "gap"):
+            family_metrics: dict[str, Any] = {}
+            for metric in PAIRED_ERROR_METRICS + PAIRED_CORRELATION_METRICS:
+                values: dict[tuple[str, int], float | None] = {}
+                for fold in FOLDS:
+                    for seed in SEEDS:
+                        full_value = _summary_section(
+                            runs[(fold, seed, "full")], "full", family, "model"
+                        ).get(metric)
+                        if control == "idw":
+                            control_value = _summary_section(
+                                runs[(fold, seed, "full")], "full", family, "idw"
+                            ).get(metric)
+                        else:
+                            control_value = _summary_section(
+                                runs[(fold, seed, control)], control, family, "model"
+                            ).get(metric)
+                        if all(
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                            for value in (full_value, control_value)
+                        ):
+                            if metric in PAIRED_CORRELATION_METRICS:
+                                values[(fold, seed)] = float(full_value) - float(control_value)
+                            else:
+                                values[(fold, seed)] = float(control_value) - float(full_value)
+                        else:
+                            values[(fold, seed)] = None
+                family_metrics[metric] = _descriptive_summary(values)
+            paired[comparison][family] = family_metrics
+
+    full_strata: dict[str, Any] = {}
+    full_supported: dict[str, Any] = {}
+    for family in ("ordinary", "gap"):
+        summaries = {
+            (fold, seed): runs[(fold, seed, "full")]["metrics"]["round4"][
+                "families"
+            ][family]["summary"]
+            for fold in FOLDS
+            for seed in SEEDS
+        }
+        stratum_names = sorted(
+            {
+                name
+                for summary in summaries.values()
+                for name in summary.get("strata", {})
+            }
+        )
+        full_strata[family] = {}
+        for name in stratum_names:
+            full_strata[family][name] = {
+                metric: _descriptive_summary(
+                    {
+                        identity: summary.get("strata", {})
+                        .get(name, {})
+                        .get("model", {})
+                        .get(metric)
+                        for identity, summary in summaries.items()
+                    }
+                )
+                for metric in SCIENTIFIC_METRICS
+            }
+            full_strata[family][name]["coverage"] = _descriptive_summary(
+                {
+                    identity: summary.get("strata", {}).get(name, {}).get("coverage")
+                    for identity, summary in summaries.items()
+                }
+            )
+        supported_names = sorted(
+            {
+                name
+                for summary in summaries.values()
+                for name in summary.get("supported_genes", {})
+            }
+        )
+        full_supported[family] = {
+            name: {
+                metric: _descriptive_summary(
+                    {
+                        identity: summary.get("supported_genes", {})
+                        .get(name, {})
+                        .get(metric)
+                        for identity, summary in summaries.items()
+                    }
+                )
+                for metric in SCIENTIFIC_METRICS
+            }
+            for name in supported_names
+        }
+    return {
+        "methods_raw_x": methods,
+        "strict_idw_raw_x": strict_idw,
+        "full_clipped_zero_secondary": clipped_secondary,
+        "paired_control_gains": paired,
+        "full_stratified_raw_x": full_strata,
+        "full_supported_genes_raw_x": full_supported,
+    }
 def _round_invariance(runs: dict[tuple[str, int, str], dict[str, Any]]) -> dict[str, Any]:
     comparisons = 0
     mismatches: list[dict[str, Any]] = []
@@ -437,6 +717,7 @@ def summarize_formal_matrix(
         "gap_depth3_4_round4_vs_round2_gain": _effect_summary(depth34),
     }
     invariance = _round_invariance(runs)
+    scientific_report = _scientific_report(runs)
     checks = {
         "gap_vs_idw": (
             effects["gap_full_vs_idw_gain"]["overall_mean"] > 0
@@ -473,6 +754,7 @@ def summarize_formal_matrix(
         "accepted": all(checks.values()),
         "checks": checks,
         "effects": effects,
+        "scientific_report": scientific_report,
         "round_invariance": invariance,
     }
 
@@ -484,11 +766,52 @@ def _formal_acceptance_artifacts(result: dict[str, Any]) -> dict[str, bytes]:
     for comparison, summary in result["effects"].items():
         for row in summary["fold_x_init"]:
             writer.writerow({"comparison": comparison, **row})
+    scientific_buffer = io.StringIO(newline="")
+    scientific_writer = csv.DictWriter(
+        scientific_buffer,
+        fieldnames=("method", "family", "metric", "fold", "seed", "value"),
+    )
+    scientific_writer.writeheader()
+    for method, families in result["scientific_report"]["methods_raw_x"].items():
+        for family, metrics in families.items():
+            for metric, summary in metrics.items():
+                for row in summary["fold_x_init"]:
+                    scientific_writer.writerow(
+                        {"method": method, "family": family, "metric": metric, **row}
+                    )
+    for family, metrics in result["scientific_report"]["strict_idw_raw_x"].items():
+        for metric, summary in metrics.items():
+            for row in summary["fold_x_init"]:
+                scientific_writer.writerow(
+                    {"method": "strict-idw", "family": family, "metric": metric, **row}
+                )
+    paired_buffer = io.StringIO(newline="")
+    paired_writer = csv.DictWriter(
+        paired_buffer,
+        fieldnames=("comparison", "family", "metric", "fold", "seed", "value"),
+    )
+    paired_writer.writeheader()
+    for comparison, families in result["scientific_report"][
+        "paired_control_gains"
+    ].items():
+        for family, metrics in families.items():
+            for metric, summary in metrics.items():
+                for row in summary["fold_x_init"]:
+                    paired_writer.writerow(
+                        {
+                            "comparison": comparison,
+                            "family": family,
+                            "metric": metric,
+                            **row,
+                        }
+                    )
     return {
         "formal_acceptance.json": (
             json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
         ).encode("utf-8"),
         "formal_run_effects.csv": csv_buffer.getvalue().encode("utf-8"),
+        "formal_scientific_metrics.csv": scientific_buffer.getvalue().encode("utf-8"),
+        "formal_paired_metrics.csv": paired_buffer.getvalue().encode("utf-8"),
     }
 
 
