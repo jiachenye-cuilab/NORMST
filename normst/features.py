@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .artifacts import environment, file_identity, writer_lock
+from .artifacts import _sync_file, environment, file_identity, writer_lock
 from .data import feature_metadata_path, feature_record, manifest, read_json, runtime, validate_feature_arrays, write_json
 from .geometry import basis_shape
 
@@ -88,8 +88,7 @@ def extract(data_path, weights, *, device="cuda:0", batch_tiles=8):
                 del features
                 # Completion metadata is the commit record; readers reject earlier states.
                 for path in (staged, normalization):
-                    with path.open("rb") as stream:
-                        os.fsync(stream.fileno())
+                    _sync_file(path)
                 os.replace(normalization, destination.with_suffix(".normalization.npz"))
                 os.replace(staged, destination)
                 write_json(marker, record)
