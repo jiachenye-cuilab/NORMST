@@ -1,0 +1,7 @@
+NORMST is distributed under the MIT License (see LICENSE).
+
+The implementation includes adaptations of MIT-licensed SRNO components.
+The original copyright and permission notice is retained in licenses/SRNO-MIT.txt.
+
+Virchow2 model weights are not included. Their provider's separate license and
+access terms apply: https://huggingface.co/paige-ai/Virchow2

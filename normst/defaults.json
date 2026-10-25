@@ -1,0 +1,21 @@
+{
+  "seed": 2027,
+  "epochs": 180,
+  "learning_rate": 0.0006,
+  "minimum_learning_rate": 0.00001,
+  "warmup_epochs": 5,
+  "schedule_horizon_epochs": 180,
+  "weight_decay": 0.0001,
+  "gradient_clip": 5.0,
+  "batch_groups": 32,
+  "block_um": 200,
+  "offsets_um": [[0, 0], [100, 0], [0, 100], [100, 100]],
+  "query_chunk": 1024,
+  "cpu_threads": 2,
+  "conditioning": {
+    "latent_pitch_um": 32,
+    "neighbors": 8,
+    "kernel_um": 100,
+    "conditioning_chunk_points": 256
+  }
+}
