@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import tempfile
 
+from filelock import FileLock, Timeout
 import torch
 
 
@@ -21,11 +22,21 @@ def file_identity(path):
 
 
 def sync_directory(path):
+    # Windows does not support opening directories for fsync through os.
+    # File contents are still synced before publication on every platform.
+    if os.name == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _sync_file(path):
+    # Windows FlushFileBuffers requires a writable handle. Do not truncate.
+    with Path(path).open("r+b") as stream:
+        os.fsync(stream.fileno())
 
 
 @contextmanager
@@ -36,8 +47,7 @@ def atomic_file(path):
     os.close(descriptor)
     try:
         yield Path(temporary)
-        with open(temporary, "rb") as stream:
-            os.fsync(stream.fileno())
+        _sync_file(temporary)
         os.replace(temporary, path)
         sync_directory(path.parent)
     finally:
@@ -56,18 +66,16 @@ def save_checkpoint(path, value):
 
 @contextmanager
 def writer_lock(path):
-    """Prevent simultaneous writers; POSIX releases the lock on process exit."""
-    import fcntl
-
-    with Path(path).open("a+b") as stream:
-        try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError(f"another writer holds {Path(path).name}") from error
-        try:
-            yield
-        finally:
-            fcntl.flock(stream, fcntl.LOCK_UN)
+    """Acquire an exclusive native file lock without waiting for another writer."""
+    lock = FileLock(path)
+    try:
+        lock.acquire(blocking=False)
+    except Timeout as error:
+        raise RuntimeError(f"another writer holds {Path(path).name}") from error
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 @contextmanager
@@ -85,8 +93,7 @@ def staged_directory(destination):
             write_json(staging / "status.json", dict(status="complete"))
             for path in staging.iterdir():
                 if path.is_file():
-                    with path.open("rb") as stream:
-                        os.fsync(stream.fileno())
+                    _sync_file(path)
             os.rename(staging, destination)
             sync_directory(destination.parent)
         except BaseException:
@@ -97,7 +104,7 @@ def staged_directory(destination):
 
 def environment(device):
     packages = {}
-    for name in ("numpy", "scipy", "torch", "timm", "safetensors", "Pillow", "tifffile", "h5py"):
+    for name in ("numpy", "scipy", "torch", "filelock", "timm", "safetensors", "Pillow", "tifffile", "h5py"):
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

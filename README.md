@@ -16,9 +16,9 @@ pip install -e ".[histology]"
 
 For a pinned environment, use the [reproducibility instructions](docs/reproducibility.md) and [version lock](requirements-lock.txt). If image features are already prepared, the core package can be installed with `pip install -e .`.
 
-## Quick example
+## Synthetic end-to-end example
 
-This synthetic CPU example uses generated counts and seven-channel features to check loading, four training epochs, checkpoint saving, and prediction. It requires no dataset or pretrained weights and serves as a software demonstration rather than biological validation.
+This CPU example uses generated counts and seven-channel features to run input loading, four training epochs, checkpoint saving, and prediction. It requires no real dataset or pretrained weights.
 
 ```bash
 python examples/synthetic.py --output outputs/demo
@@ -62,7 +62,7 @@ normst predict --checkpoint outputs/section/model/model.pt \
 | `prediction/genes.json` | Gene IDs in column order |
 | `prediction/coverage_fraction.npy` | Fraction of each grid bin covered by valid image features |
 
-Outputs are model estimates of captured counts per region, not direct single-cell measurements. Grid spacing describes the readout, rather than a validated biological resolution. Image coverage selects output bins; a separate mask can restrict them to tissue. Each checkpoint is section-specific. All supplied spots participate in fitting, so held-out spots must be excluded from the input; see the [input and evaluation requirements](docs/input_output.md).
+Outputs are model-estimated counts for each requested region. Each checkpoint is section-specific. All supplied spots participate in fitting, so held-out spots must be excluded from the input. See [Input and output formats](docs/input_output.md) for evaluation requirements, spatial resolution and coverage masks.
 
 The default training configuration uses seed **2027**, **180 fixed epochs**, a 32-channel image bypass, and frozen Virchow2 features. The expression network has **504,048 trainable parameters** for 2,000 genes. Training combines conditional allocation, coarse-group total, and observed-spot count losses using observed counts as supervision. Settings are in [defaults.json](normst/defaults.json).
 
@@ -72,7 +72,7 @@ Feature extraction and prediction publish completion records after validation. T
 python -m unittest discover -s tests
 ```
 
-Tests cover input integrity, interrupted training, initialization compatibility, gradients, conservation and grid additivity. Conservation is enforced by the readout and does not establish super-resolution accuracy. Use `normst --help` for available commands.
+Tests cover file locking and atomic publication, input integrity, interrupted training, initialization compatibility, gradients, conservation and grid additivity. Use `normst --help` for available commands.
 
 ## License and support
 

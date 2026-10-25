@@ -77,11 +77,11 @@ Resume uses the saved configuration when `--config` is omitted; if supplied, it 
 
 **Predictions.** Prediction uses a sibling `.partial-*` directory. It validates all counts and writes row/column metadata and content identifiers before atomically renaming the complete directory to the requested output. Use the final directory with `status.json` and `prediction.json` both marked complete. If interrupted, the final path remains absent; rerun the same command to recompute. Completed directories are preserved. Failed staging directories can be inspected and removed once their process has stopped. An abrupt process kill may leave a `running` marker in staging; this does not indicate completion.
 
-Local writers use POSIX advisory locks, released automatically on exit. The small lock files may remain in place. Atomic publication requires staging and destination to be on the same filesystem; staging is created beside its destination for this reason. Sufficient space is needed for staging, the last recovery checkpoint and temporary integration arrays.
+Local writers use non-blocking `filelock` locks with native Windows and POSIX backends, released automatically on process exit. The small lock files may remain in place. Atomic publication requires staging and destination to be on the same filesystem; staging is created beside its destination for this reason. File contents are synced through writable handles, which are closed before replacement. POSIX also syncs directory metadata; Windows skips the unsupported directory sync. File-sync and publication errors propagate to the caller. Sufficient space is needed for staging, the last recovery checkpoint and temporary integration arrays.
 
 ## Query grids and regions
 
-`normst predict --bin-um 16` changes the output bin size without refitting. The bin size must be a multiple of 8 µm and divide the field extents. This is a readout of the same fitted field, not a change in its learned resolution.
+`normst predict --bin-um 16` changes the output bin size without refitting. The bin size must be a multiple of 8 µm and divide the field extents. This reads out the same fitted field. Grid spacing specifies the sampling of model estimates; it does not establish a validated biological resolution or constitute direct single-cell measurement.
 
 By default, grid output includes bins containing **any** valid 8 µm image cell; this is **not a tissue segmentation**. Every selected square is integrated over its full area, including uncovered subcells. `coverage_fraction.npy` reports the covered fraction in output-row order. Thus a partially covered 16 µm bin need not equal the sum of the emitted, coverage-filtered 8 µm rows. Additivity holds when the compared outputs cover the same physical support. To restrict output to tissue, use `--mask tissue_mask.npy`, a boolean mask on the requested output grid. The mask selects rows without truncating capture supports used for total correction.
 
@@ -89,6 +89,6 @@ For circular query regions, supply `--queries queries.npz` containing `centers_y
 
 Counts are computed with the fixed 2 µm midpoint integration rule. Within each observed capture region, the field is rescaled gene by gene to reproduce the measured total; between observed regions, the raw field is retained. A bin crossing a capture boundary combines corrected capture and uncorrected gap contributions. `raw_spot_counts.npy` contains the model's uncorrected integrals over the supplied input spots.
 
-This enforced conservation checks readout consistency; fine-scale accuracy requires independent evidence. An 8 µm output grid does not turn the estimates into direct single-cell measurements.
+Observed-total correction enforces conservation by construction. This checks readout consistency; fine-scale accuracy requires independent evidence.
 
 The checkpoint is section-specific and includes its observations and image features. Fit a new checkpoint for a new section. No pretrained expression checkpoint or real dataset is bundled.

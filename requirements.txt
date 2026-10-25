@@ -2,6 +2,7 @@
 numpy==2.3.5
 scipy==1.18.0
 torch==2.5.1
+filelock==3.29.4
 timm==1.0.28
 safetensors==0.8.0
 Pillow==11.3.0
