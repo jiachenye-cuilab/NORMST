@@ -8,8 +8,9 @@ from scipy import sparse
 from scipy.spatial import cKDTree
 import torch
 
+from .artifacts import environment, file_identity, staged_directory
 from .data import runtime, write_json
-from .geometry import BasisIntegrals, circle_quadrature, geometry, knot_points, stencil
+from .geometry import BasisIntegrals, capture_query_quadrature, geometry, knot_points, observed_owners, stencil
 from .model import NORMST
 
 
@@ -52,22 +53,6 @@ def multiply(matrix, coefficients, device):
     return torch.sparse.mm(weights, selected).cpu().numpy()
 
 
-def observed_owners(points, data, tree):
-    if np.all(data["radii"] == data["radii"][0]):
-        distance, owners = tree.query(points)
-        return np.where(distance <= data["radii"][owners], owners, -1)
-    owners = np.full(len(points), -1, dtype=np.int64)
-    candidates = tree.query_ball_point(points, data["radii"].max())
-    for i, nearby in enumerate(candidates):
-        ids = np.asarray(nearby, dtype=np.int64)
-        inside = ids[np.square(data["centers"][ids] - points[i]).sum(1) <= np.square(data["radii"][ids])]
-        if len(inside) > 1:
-            raise ValueError("overlapping observed supports")
-        if len(inside):
-            owners[i] = inside[0]
-    return owners
-
-
 def projected_integrals(points, weights, rows, count, field, coefficients, data, factors, tree):
     device = field.bounds.device
     raw = multiply(point_matrix(points, weights, rows, count, field), coefficients, device)
@@ -86,28 +71,34 @@ def projected_integrals(points, weights, rows, count, field, coefficients, data,
 
 @torch.no_grad()
 def predict(checkpoint, output, *, device="cuda:0", bin_um=8, mask=None, queries=None, batch=128):
+    with staged_directory(output) as staging:
+        _predict(checkpoint, staging, device=device, bin_um=bin_um, mask=mask, queries=queries, batch=batch)
+    return Path(output) / "counts.npy"
+
+
+def _predict(checkpoint, output, *, device, bin_um, mask, queries, batch):
     device = runtime(device)
-    if batch < 1:
+    if type(batch) is not int or batch < 1:
         raise ValueError("batch must be positive")
     field, data = load_model(checkpoint, device)
     bounds = data["bounds"]
     if (bounds % 2).any():
         raise ValueError("prediction requires field bounds on the native 2 um integration lattice")
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=False)
     if queries is None:
-        if bin_um < 8 or bin_um % 8 or np.any((bounds[2:] - bounds[:2]) % bin_um):
+        if type(bin_um) is not int or bin_um < 8 or bin_um % 8 or np.any((bounds[2:] - bounds[:2]) % bin_um):
             raise ValueError("bin_um must be a multiple of 8 um and tile the field bounds")
         shape = np.rint((bounds[2:] - bounds[:2]) / bin_um).astype(int)
         valid = field.feature_valid[0, 0].cpu().numpy()
         factor = bin_um // 8
-        valid = valid.reshape(shape[0], factor, shape[1], factor).any(axis=(1, 3))
+        coverage = valid.reshape(shape[0], factor, shape[1], factor).mean(axis=(1, 3))
+        valid = coverage > 0
         if mask is not None:
             selected = np.load(mask, allow_pickle=False)
             if selected.shape != tuple(shape) or selected.dtype != np.bool_:
                 raise ValueError("output mask must be boolean and match the requested output grid")
             valid &= selected
         cells = np.argwhere(valid)
+        np.save(output / "coverage_fraction.npy", coverage[valid].astype(np.float32), allow_pickle=False)
         centers = bounds[:2] + (cells + .5) * bin_um
         offsets = (np.indices((bin_um // 2, bin_um // 2)).reshape(2, -1).T + .5) * 2 - bin_um / 2
         radii = None
@@ -152,18 +143,28 @@ def predict(checkpoint, output, *, device="cuda:0", bin_um=8, mask=None, queries
                 weights = np.full(len(points), 4.)
                 owners = np.repeat(np.arange(len(current)), len(offsets))
             else:
-                points, weights, owners = circle_quadrature(current, radii[first:first + batch], data["quadrature"])
+                points, weights, owners = capture_query_quadrature(current, radii[first:first + batch], data)
             result[first:first + len(current)] = projected_integrals(
                 points, weights, owners, len(current), field, coefficients, data, factors, tree).astype(np.float32)
             if first == 0 or first + batch >= len(centers) or first // batch % 32 == 0:
                 print(f"predicted regions {first + len(current)}/{len(centers)}", flush=True)
         result.flush()
         del coefficients
+    for first in range(0, len(result), batch):
+        if not np.isfinite(result[first:first + batch]).all() or (result[first:first + batch] < 0).any():
+            raise ValueError("prediction output contains invalid values")
     np.save(output / "centers_yx_um.npy", centers, allow_pickle=False)
     if radii is not None:
         np.save(output / "radius_um.npy", radii, allow_pickle=False)
     write_json(output / "genes.json", data["gene_ids"])
-    write_json(output / "prediction.json", dict(shape=list(result.shape), units="expected captured UMI counts",
+    write_json(output / "prediction.json", dict(status="complete", shape=list(result.shape), units="expected captured UMI counts",
         region="square" if radii is None else "circle", bin_um=bin_um if radii is None else None,
-        integration_pitch_um=2, observed_total_projection=True, bounds_yxyx_um=bounds.tolist()))
+        integration_pitch_um=2, observed_total_projection=True, bounds_yxyx_um=bounds.tolist(),
+        coverage_rule="any valid 8 um cell; integrate the full square" if radii is None else "query geometry independent of image coverage",
+        environment=environment(device), checkpoint=file_identity(checkpoint),
+        mask=file_identity(mask) if mask is not None else None,
+        queries=file_identity(queries) if queries is not None else None, batch=batch,
+        outputs={path.name: file_identity(path) for path in sorted(output.iterdir()) if path.suffix in (".npy", ".json")
+                 and path.name not in ("status.json", "prediction.json")}))
+    del result
     return destination

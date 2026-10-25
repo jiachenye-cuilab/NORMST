@@ -1,13 +1,16 @@
 """Frozen Virchow2 CLS/patch tokens and RGB on an aligned 8 um grid."""
 
 import math
+import os
 from pathlib import Path
+import tempfile
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .data import manifest, runtime, write_json
+from .artifacts import environment, file_identity, writer_lock
+from .data import feature_metadata_path, feature_record, manifest, read_json, runtime, validate_feature_arrays, write_json
 from .geometry import basis_shape
 
 
@@ -56,12 +59,71 @@ def normalize_features(features, valid):
 
 
 def extract(data_path, weights, *, device="cuda:0", batch_tiles=8):
+    spec = manifest(data_path)
+    destination = Path(spec["features"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    marker = feature_metadata_path(spec)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with writer_lock(destination.with_suffix(".lock")):
+        previous = read_json(marker) if marker.exists() else {}
+        if previous.get("status") == "complete" or (destination.exists() and previous.get("source") != "normst"):
+            raise FileExistsError(f"{destination}: use a new feature path to preserve existing inputs")
+        write_json(marker, dict(format_version=1, status="running", source="normst"))
+        try:
+            with tempfile.TemporaryDirectory(prefix=f".{destination.name}.partial-", dir=destination.parent) as temporary:
+                staged = Path(temporary) / destination.name
+                _extract(spec, weights, staged, device=device, batch_tiles=batch_tiles)
+                features, _ = validate_feature_arrays(spec, staged)
+                normalization = staged.with_name("normalization.npz")
+                with np.load(normalization, allow_pickle=False) as values:
+                    if (values["mean"].shape != (len(features),) or values["scale"].shape != (len(features),)
+                            or not np.isfinite(values["mean"]).all() or not np.isfinite(values["scale"]).all()
+                            or (values["scale"] <= 0).any()):
+                        raise ValueError("invalid feature normalization statistics")
+                record = feature_record(spec, features, path=staged, source="normst", encoder="Virchow2",
+                    pitch_um=8, tile_um=112, image_pixel_um=.5, frozen=True,
+                    normalization=file_identity(normalization), normalization_file=destination.with_suffix(".normalization.npz").name,
+                    weights=file_identity(weights),
+                    image=file_identity(spec["image"]), environment=environment(device), batch_tiles=batch_tiles)
+                del features
+                # Completion metadata is the commit record; readers reject earlier states.
+                for path in (staged, normalization):
+                    with path.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                os.replace(normalization, destination.with_suffix(".normalization.npz"))
+                os.replace(staged, destination)
+                write_json(marker, record)
+        except BaseException:
+            write_json(marker, dict(format_version=1, status="failed", source="normst"))
+            raise
+    return destination
+
+
+def validate_external_features(data_path, *, confirm_complete=False):
+    """Register an external producer's finished arrays without modifying their values."""
+    if not confirm_complete:
+        raise ValueError("confirm_complete is required: array checks cannot establish that an external producer finished")
+    spec = manifest(data_path)
+    destination = Path(spec["features"])
+    marker = feature_metadata_path(spec)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with writer_lock(marker.with_suffix(".lock")):
+        previous = read_json(marker) if marker.exists() else {}
+        adjacent = destination.with_suffix(".json")
+        managed = read_json(adjacent) if adjacent != marker and adjacent.exists() else {}
+        if previous.get("source") == "normst" or managed.get("source") == "normst":
+            raise ValueError("extract-managed features must be completed by extract, not registered as external")
+        features, _ = validate_feature_arrays(spec)
+        write_json(marker, feature_record(spec, features, producer_completion_confirmed=True))
+    return marker
+
+
+def _extract(spec, weights, destination, *, device, batch_tiles):
     import tifffile
 
     device = runtime(device)
-    spec = manifest(data_path)
     height, width = basis_shape(spec["bounds_yxyx_um"], 8.)
-    if batch_tiles < 1:
+    if type(batch_tiles) is not int or batch_tiles < 1:
         raise ValueError("batch_tiles must be positive")
     if tuple(spec.get("feature_tile_offset_yx", (0, 0))) != (0, 0):
         raise ValueError("extract expects tiles anchored to the supplied image origin")
@@ -75,10 +137,6 @@ def extract(data_path, weights, *, device="cuda:0", batch_tiles=8):
         pixels = tifffile.imread(spec["image"], maxworkers=2)
     if pixels.shape != (height * 16, width * 16, 3) or pixels.dtype != np.uint8:
         raise ValueError("registered RGB TIFF must use 0.5 um pixels and cover the field bounds")
-    destination = Path(spec["features"])
-    if destination.exists():
-        raise FileExistsError(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     model = load_backbone(weights, device)
     features = np.lib.format.open_memmap(destination, mode="w+", dtype=np.float32, shape=(2563, height, width))
     features[:] = 0
@@ -104,6 +162,3 @@ def extract(data_path, weights, *, device="cuda:0", batch_tiles=8):
     means, scales = normalize_features(features, valid)
     features.flush()
     np.savez(destination.with_name("normalization.npz"), mean=means, scale=scales)
-    write_json(destination.with_suffix(".json"), dict(encoder="Virchow2", channels=2563,
-        pitch_um=8, tile_um=112, image_pixel_um=.5, shape=list(features.shape), frozen=True))
-    return destination

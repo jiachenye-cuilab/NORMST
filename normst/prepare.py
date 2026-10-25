@@ -1,7 +1,9 @@
 """Prepare classic Visium Space Ranger counts and a registered H&E image."""
 
 import csv
+from collections import Counter
 from pathlib import Path
+import warnings
 
 import numpy as np
 from scipy import sparse
@@ -10,7 +12,17 @@ from scipy.ndimage import affine_transform
 from .data import write_json
 
 
-def read_spaceranger(matrix_path, positions_path):
+def require_unique(values, label):
+    counts = Counter(values)
+    duplicates = [value for value, count in counts.items() if count > 1]
+    if duplicates:
+        repeats = sum(counts[value] - 1 for value in duplicates)
+        raise ValueError(f"{label}: {len(duplicates)} duplicate IDs ({repeats} extra entries); examples: {duplicates[:5]}")
+    if any(not value for value in values):
+        raise ValueError(f"{label}: empty IDs are not allowed")
+
+
+def read_spaceranger(matrix_path, positions_path, *, skip_missing_positions=False):
     import h5py
 
     with h5py.File(matrix_path, "r") as handle:
@@ -21,18 +33,40 @@ def read_spaceranger(matrix_path, positions_path):
         symbols = group["features/name"][:].astype(str)
         barcodes = group["barcodes"][:].astype(str)
         types = group["features/feature_type"][:].astype(str) if "feature_type" in group["features"] else None
+    if matrix.shape != (len(barcodes), len(genes)) or len(symbols) != len(genes) or (types is not None and len(types) != len(genes)):
+        raise ValueError("expression matrix dimensions do not match the barcode/feature arrays")
+    require_unique(barcodes, "expression matrix barcodes")
+    require_unique(genes, "expression matrix gene IDs")
+    if not np.isfinite(matrix.data).all() or (matrix.data < 0).any() or (matrix.data != np.floor(matrix.data)).any():
+        raise ValueError("expression matrix must contain finite nonnegative integer counts")
     with Path(positions_path).open(newline="", encoding="utf-8") as stream:
-        first = next(csv.reader(stream))
+        first = next(csv.reader(stream), [])
+        if not first:
+            raise ValueError("position table is empty")
         stream.seek(0)
         names = ["barcode", "in_tissue", "array_row", "array_col", "pxl_row_in_fullres", "pxl_col_in_fullres"]
         rows = list(csv.DictReader(stream, fieldnames=None if first[0] == "barcode" else names))
+    if any(any(key not in row or row[key] is None for key in names) for row in rows):
+        raise ValueError("position table must provide all six Space Ranger columns on every row")
+    require_unique([row["barcode"] for row in rows], "position table barcodes")
     lookup = {row["barcode"]: row for row in rows}
-    keep = np.array([i for i, b in enumerate(barcodes) if b in lookup and int(lookup[b]["in_tissue"]) == 1])
+    missing = [b for b in barcodes if b not in lookup]
+    if missing:
+        message = f"{len(missing)} of {len(barcodes)} expression barcodes lack positions; examples: {missing[:5]}"
+        if not skip_missing_positions:
+            raise ValueError(message + "; use --skip-missing-positions to explicitly exclude them")
+        warnings.warn(message + "; explicitly excluded", UserWarning, stacklevel=2)
+    if any(row["in_tissue"] not in ("0", "1") for row in rows):
+        raise ValueError("position table in_tissue values must be 0 or 1")
+    # Iterate matrix barcodes, never CSV row order: counts and geometry stay aligned.
+    keep = np.array([i for i, b in enumerate(barcodes) if b in lookup and lookup[b]["in_tissue"] == "1"], dtype=np.int64)
     if len(keep) < 3:
         raise ValueError("at least three in-tissue spots are required")
     selected = [lookup[b] for b in barcodes[keep]]
     array = np.array([[int(row[k]) for k in ("array_row", "array_col")] for row in selected])
     pixels = np.array([[float(row[k]) for k in ("pxl_row_in_fullres", "pxl_col_in_fullres")] for row in selected])
+    if not np.isfinite(pixels).all():
+        raise ValueError("in-tissue pixel coordinates must be finite")
     columns = np.flatnonzero(types == "Gene Expression") if types is not None else np.arange(len(genes))
     return matrix[keep][:, columns].astype(np.float64), genes[columns], symbols[columns], barcodes[keep], array, pixels
 
@@ -48,11 +82,12 @@ def select_genes(counts, number):
     return np.sort(eligible[np.argsort(-variance[eligible], kind="stable")[:number]])
 
 
-def prepare_visium(matrix_path, positions_path, image_path, output, *, n_genes=2000, gene_list=None):
+def prepare_visium(matrix_path, positions_path, image_path, output, *, n_genes=2000, gene_list=None, skip_missing_positions=False):
     import tifffile
     from PIL import Image
 
-    counts, genes, symbols, barcodes, array, pixels = read_spaceranger(matrix_path, positions_path)
+    counts, genes, symbols, barcodes, array, pixels = read_spaceranger(
+        matrix_path, positions_path, skip_missing_positions=skip_missing_positions)
     if gene_list is None:
         columns = select_genes(counts, n_genes)
     else:

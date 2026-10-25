@@ -3,6 +3,7 @@
 import time
 import numpy as np
 from scipy import sparse
+from scipy.spatial import cKDTree
 import torch
 
 
@@ -49,9 +50,51 @@ def circle_quadrature(centers, radii, specification):
     return np.concatenate(points), np.concatenate(weights), np.concatenate(owners)
 
 
+def observed_owners(points, data, tree):
+    """Give a shared boundary node to the lowest observation-row index."""
+    if np.all(data["radii"] == data["radii"][0]) and not len(data.get("_touching_pairs", [])):
+        distance, owners = tree.query(points)
+        return np.where(distance <= data["radii"][owners], owners, -1)
+    owners = np.full(len(points), -1, dtype=np.int64)
+    candidates = tree.query_ball_point(points, np.nextafter(data["radii"].max(), np.inf))
+    for i, nearby in enumerate(candidates):
+        ids = np.asarray(nearby, dtype=np.int64)
+        inside = ids[np.square(data["centers"][ids] - points[i]).sum(1) <= np.square(data["radii"][ids])]
+        if len(inside):
+            owners[i] = inside.min()
+    return owners
+
+
+def capture_query_quadrature(centers, radii, data):
+    """Queries matching observed circles use the same discrete capture support."""
+    points, weights, rows = circle_quadrature(centers, radii, data["quadrature"])
+    if len(data.get("_touching_pairs", [])):
+        matched = np.full(len(centers), -1, dtype=np.int64)
+        for row, (center, radius) in enumerate(zip(centers, radii)):
+            indices = np.flatnonzero((data["centers"] == center).all(1) & (data["radii"] == radius))
+            if len(indices):
+                matched[row] = indices[0]
+        owners = observed_owners(points, data, cKDTree(data["centers"]))
+        keep = (matched[rows] < 0) | (matched[rows] == owners)
+        points, weights, rows = points[keep], weights[keep], rows[keep]
+    return points, weights, rows
+
+
 def geometry(data):
+    if "_touching_pairs" not in data:
+        pairs = cKDTree(data["centers"]).query_pairs(2 * data["radii"].max(), output_type="ndarray")
+        separation = np.linalg.norm(data["centers"][pairs[:, 0]] - data["centers"][pairs[:, 1]], axis=1)
+        radii = data["radii"][pairs].sum(1)
+        if (separation < radii).any():
+            raise ValueError("overlapping capture circles are not supported")
+        data["_touching_pairs"] = pairs[separation == radii]
     points, weights, owners = circle_quadrature(data["centers"], data["radii"], data["quadrature"])
+    if len(data["_touching_pairs"]) and data["quadrature"]["kind"] == "native_bin_centers":
+        keep = owners == observed_owners(points, data, cKDTree(data["centers"]))
+        points, weights, owners = points[keep], weights[keep], owners[keep]
     areas = np.bincount(owners, weights=weights, minlength=len(data["centers"]))
+    if (areas <= 0).any():
+        raise ValueError("every observed spot must own at least one integration node")
     if data["support_bins"] is not None:
         np.testing.assert_array_equal(areas, data["support_bins"] * data["quadrature"]["bin_um"] ** 2)
     data["areas"] = areas
@@ -61,6 +104,8 @@ def geometry(data):
 
 def basis_shape(bounds, pitch):
     bounds = np.asarray(bounds, dtype=np.float64)
+    if bounds.shape != (4,):
+        raise ValueError("bounds must contain [y_min, x_min, y_max, x_max]")
     shape = (bounds[2:] - bounds[:2]) / pitch
     if (bounds.shape != (4,) or not np.isfinite(bounds).all() or not np.isfinite(pitch)
             or pitch <= 0 or (shape < 2).any() or not np.allclose(shape, np.rint(shape), rtol=0, atol=1e-8)):

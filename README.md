@@ -2,7 +2,7 @@
 
 **Histology-guided super-resolution of spatial transcriptomics.**
 
-NORMST combines measured Visium spot counts with a registered H&E image to estimate spatial gene expression on a finer grid. It learns from the measured capture regions and preserves their gene-wise totals in the final readout. The default output spacing is **8 µm**; these are model estimates, not direct single-cell measurements.
+NORMST combines raw Visium spot counts with a registered H&E image to learn a continuous spatial expression field. It produces gene-expression estimates on an **8 µm grid**, larger grids, or circular query regions, while preserving measured gene-wise totals within observed capture regions.
 
 ## Installation
 
@@ -14,17 +14,15 @@ cd NORMST
 pip install -e ".[histology]"
 ```
 
-The tested dependency versions are listed in [requirements.txt](requirements.txt). If image features are already prepared, the core package can be installed with `pip install -e .`.
+For a pinned environment, use the [reproducibility instructions](docs/reproducibility.md) and [version lock](requirements-lock.txt). If image features are already prepared, the core package can be installed with `pip install -e .`.
 
 ## Quick example
 
-Run a small CPU example with generated counts and image features—no data or pretrained weights are required:
+This synthetic CPU example uses generated counts and seven-channel features to check loading, four training epochs, checkpoint saving, and prediction. It requires no dataset or pretrained weights and serves as a software demonstration rather than biological validation.
 
 ```bash
 python examples/synthetic.py --output outputs/demo
 ```
-
-This exercises input loading, four training epochs, checkpoint saving, and prediction. It is a workflow check, not a biological example.
 
 ## Analyze a Visium section
 
@@ -58,17 +56,23 @@ normst predict --checkpoint outputs/section/model/model.pt \
 | File | Contents |
 | --- | --- |
 | `model/model.pt` | Fitted model, image features, and observed counts needed for inference |
+| `model/resume.pt` | Periodic training state for recovery after interruption |
 | `prediction/counts.npy` | Nonnegative expected counts, with regions as rows and genes as columns |
 | `prediction/centers_yx_um.npy` | Output region centers in physical `(y, x)` coordinates |
 | `prediction/genes.json` | Gene IDs in column order |
+| `prediction/coverage_fraction.npy` | Fraction of each grid bin covered by valid image features |
 
-The default recipe uses seed **2027**, **180 fixed epochs**, a 32-channel image bypass, and frozen Virchow2 features. The expression network has **504,048 trainable parameters** for 2,000 genes. Training combines conditional allocation, coarse-group total, and observed-spot count losses; it requires no fine-resolution expression labels. Settings are in [defaults.json](normst/defaults.json).
+Outputs are model estimates of captured counts per region, not direct single-cell measurements. Grid spacing describes the readout, rather than a validated biological resolution. Image coverage selects output bins; a separate mask can restrict them to tissue. Each checkpoint is section-specific. All supplied spots participate in fitting, so held-out spots must be excluded from the input; see the [input and evaluation requirements](docs/input_output.md).
+
+The default training configuration uses seed **2027**, **180 fixed epochs**, a 32-channel image bypass, and frozen Virchow2 features. The expression network has **504,048 trainable parameters** for 2,000 genes. Training combines conditional allocation, coarse-group total, and observed-spot count losses using observed counts as supervision. Settings are in [defaults.json](normst/defaults.json).
+
+Feature extraction and prediction publish completion records after validation. Training writes configuration, software versions and input identifiers, and supports `--resume`. See [artifact completion and recovery](docs/input_output.md#completion-and-recovery).
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-These checks cover training gradients, checkpoint reloads, and observed-count conservation. Use `normst --help` or a subcommand's `--help` for available options.
+Tests cover input integrity, interrupted training, initialization compatibility, gradients, conservation and grid additivity. Conservation is enforced by the readout and does not establish super-resolution accuracy. Use `normst --help` for available commands.
 
 ## License and support
 

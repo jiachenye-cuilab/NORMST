@@ -80,8 +80,9 @@ class InputTests(unittest.TestCase):
                     scale = torch.arange(1280, dtype=batch.dtype, device=batch.device)[None, None, :] / 1280
                     return (base + scale + batch.mean((1, 2, 3))[:, None, None]).expand(len(batch), -1, -1)
 
+            (folder / "toy-weights.bin").write_bytes(b"synthetic test double; no pretrained weights")
             with patch("normst.features.load_backbone", return_value=ToyBackbone()):
-                extract(dataset, folder / "unused.safetensors", device="cpu", batch_tiles=4)
+                extract(dataset, folder / "toy-weights.bin", device="cpu", batch_tiles=4)
             features, valid = load_image_features(spec)
             self.assertEqual(features.shape[1], 2563)
             selected = features[0, :, valid[0, 0]].numpy()

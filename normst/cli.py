@@ -13,6 +13,7 @@ def main(argv=None):
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--genes", type=int, default=2000)
     prepare.add_argument("--gene-list", help="optional text file with one gene ID per line, in output order")
+    prepare.add_argument("--skip-missing-positions", action="store_true", help="explicitly exclude expression barcodes missing from the position table")
 
     features = commands.add_parser("extract", help="extract frozen Virchow2 image features")
     features.add_argument("--data", required=True, help="dataset.json")
@@ -20,11 +21,18 @@ def main(argv=None):
     features.add_argument("--device", default="cuda:0")
     features.add_argument("--batch-tiles", type=int, default=8)
 
-    train = commands.add_parser("train", help="fit the final expression model to all supplied spots")
+    validate = commands.add_parser("validate-features", help="validate and register completed external image features")
+    validate.add_argument("--data", required=True, help="dataset.json")
+    validate.add_argument("--confirm-complete", action="store_true", required=True,
+                          help="confirm the external producer completed extraction and preprocessing")
+
+    train = commands.add_parser("train", help="fit the expression model to all supplied spots")
     train.add_argument("--data", required=True, help="dataset.json")
     train.add_argument("--output", required=True)
     train.add_argument("--config", help="optional JSON overrides of the default training settings")
     train.add_argument("--device", default="cuda:0")
+    train.add_argument("--resume", help="resume.pt from an interrupted run with the same inputs and settings")
+    train.add_argument("--checkpoint-every", type=int, default=100, help="save recovery state every N optimizer updates, and every epoch")
 
     predict = commands.add_parser("predict", help="export count estimates on a grid or in query circles")
     predict.add_argument("--checkpoint", required=True)
@@ -39,13 +47,17 @@ def main(argv=None):
     if args.command == "prepare-visium":
         from .prepare import prepare_visium
         path = prepare_visium(args.matrix, args.positions, args.image, args.output,
-                              n_genes=args.genes, gene_list=args.gene_list)
+                              n_genes=args.genes, gene_list=args.gene_list, skip_missing_positions=args.skip_missing_positions)
     elif args.command == "extract":
         from .features import extract
         path = extract(args.data, args.weights, device=args.device, batch_tiles=args.batch_tiles)
+    elif args.command == "validate-features":
+        from .features import validate_external_features
+        path = validate_external_features(args.data, confirm_complete=args.confirm_complete)
     elif args.command == "train":
         from .train import fit
-        path = fit(args.data, args.output, device=args.device, config=args.config)
+        path = fit(args.data, args.output, device=args.device, config=args.config,
+                   resume=args.resume, checkpoint_every=args.checkpoint_every)
     else:
         from .predict import predict as export
         path = export(args.checkpoint, args.output, device=args.device, bin_um=args.bin_um,

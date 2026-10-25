@@ -1,4 +1,4 @@
-"""The final CNN expression field with a 32-channel image bypass."""
+"""A CNN expression field with a 32-channel image bypass."""
 
 import math
 
@@ -46,6 +46,10 @@ def _seeded_layers(genes, channels):
 
     Keeping this draw order makes seeded weights reproducible. Temporary layers
     below reserve draws only; they are not parameters of the returned network.
+    The 16-to-32 bypass and 82-to-98-to-114 input expansions also preserve the
+    initialized parameter values. Constructing full-width layers directly would
+    change them. Keep the draw order, copied slices, zero padding, and fork_rng
+    scopes together as the seeded-initialization compatibility contract.
     """
     encoder = nn.Sequential(nn.Conv2d(genes + 3, 64, 1), nn.GELU(), ResidualEncoderBlock(64))
     for _ in range(2):
@@ -187,7 +191,7 @@ class NORMST(CompactHistologyMixin, _Field):
     """Trainable expression network; frozen image features are supplied separately.
 
     Contexts use raw observed counts. All physical coordinates are (y, x) in um.
-    The final architecture has 504,048 parameters for 2,000 genes and 2,563 image
+    The architecture has 504,048 parameters for 2,000 genes and 2,563 image
     channels. Compact storage is lossless and does not change the architecture.
     """
     def __init__(self, context, bounds, features, feature_valid, *, compact=True, tile_offset_yx=(0, 0)):

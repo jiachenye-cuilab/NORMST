@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from normst.data import write_json
+from normst.features import validate_external_features
 from normst.predict import predict
 from normst.train import fit
 
@@ -24,6 +25,7 @@ def make_inputs(folder):
     np.save(folder / "feature_valid.npy", np.ones((40, 40), dtype=bool), allow_pickle=False)
     write_json(folder / "dataset.json", dict(observations="observations.npz", features="features.npy",
         feature_valid="feature_valid.npy", bounds_yxyx_um=bounds))
+    validate_external_features(folder / "dataset.json", confirm_complete=True)
     return folder / "dataset.json"
 
 
